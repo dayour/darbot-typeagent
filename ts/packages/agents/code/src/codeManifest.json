@@ -5,7 +5,10 @@
   "schema": {
     "description": "Code agent helps you with productivity in using an editor and performing actions like creating files, editor customization, writing code, intelligent code suggestions, real-time error detection, debugging, and source control tasks etc.",
     "schemaFile": "./codeActionsSchema.ts",
-    "schemaType": "CodeActions"
+    "schemaType": {
+      "action": "CodeActions",
+      "activity": "CodeActivity"
+    }
   },
   "subActionManifests": {
     "code-debug": {
@@ -31,9 +34,23 @@
     },
     "code-editor": {
       "schema": {
-        "description": "Code agent that helps you perform vscode editor actions like go to a reference, reveal a declaration, clipboard copy or paste, add a comment line etc.",
-        "schemaFile": "./vscode/editorCommandActionsSchema.ts",
-        "schemaType": "CodeEditorActions"
+        "description": "Code agent that helps you perform vscode editor actions like create a new file, go to a reference, reveal a declaration, clipboard copy or paste, add a comment line etc.",
+        "schemaFile": "./vscode/editorCodeActionsSchema.ts",
+        "schemaType": "EditorCodeActions"
+      }
+    },
+    "code-workbench": {
+      "schema": {
+        "description": "Code agent that helps you perform vscode workbench actions like open a file, close a file etc.",
+        "schemaFile": "./vscode/workbenchCommandActionsSchema.ts",
+        "schemaType": "CodeWorkbenchActions"
+      }
+    },
+    "code-extension": {
+      "schema": {
+        "description": "Code agent that helps you perform vscode extension actions like show, install, update, enable, disable, uninstall extensions etc.",
+        "schemaFile": "./vscode/extensionsActionsSchema.ts",
+        "schemaType": "CodeWorkbenchExtensionActions"
       }
     }
   }

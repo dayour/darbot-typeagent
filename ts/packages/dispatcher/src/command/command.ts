@@ -8,7 +8,6 @@ import { getDefaultExplainerName } from "agent-cache";
 import {
     CommandHandlerContext,
     ensureCommandResult,
-    getCommandResult,
 } from "../context/commandHandlerContext.js";
 
 import {
@@ -20,8 +19,9 @@ import { executeCommand } from "../execute/actionHandlers.js";
 import { isCommandDescriptorTable } from "@typeagent/agent-sdk/helpers/command";
 import { parseParams } from "./parameters.js";
 import { getHandlerTableUsage, getUsage } from "./commandHelp.js";
-import { CommandResult } from "../dispatcher.js";
+import { CommandResult, DispatcherStatus } from "../dispatcher.js";
 import { DispatcherName } from "../context/dispatcher/dispatcherUtils.js";
+import { getAppAgentName } from "../internal.js";
 
 const debugCommand = registerDebug("typeagent:dispatcher:command");
 const debugCommandError = registerDebug("typeagent:dispatcher:command:error");
@@ -169,17 +169,23 @@ export async function resolveCommand(
     return result;
 }
 
+export function normalizeCommand(
+    originalInput: string,
+    context: CommandHandlerContext,
+) {
+    const input = originalInput.trim();
+    if (!input.startsWith("@")) {
+        const requestHandlerAgent = context.session.getConfig().request;
+        return `${requestHandlerAgent} request ${input}`;
+    }
+    return input.substring(1);
+}
+
 async function parseCommand(
     originalInput: string,
     context: CommandHandlerContext,
 ) {
-    let input = originalInput.trim();
-    if (!input.startsWith("@")) {
-        const requestHandlerAgent = context.session.getConfig().request;
-        input = `${requestHandlerAgent} request ${input}`;
-    } else {
-        input = input.substring(1);
-    }
+    const input = normalizeCommand(originalInput, context);
     const result = await resolveCommand(input, context);
     if (result.descriptor !== undefined) {
         context.logger?.logEvent("command", {
@@ -287,10 +293,11 @@ export async function processCommandNoLock(
         );
         debugCommandError(e.stack);
 
-        const commandResult = getCommandResult(context);
-        if (commandResult !== undefined) {
-            commandResult.exception = e.message;
-        }
+        context?.logger?.logEvent("command:exception", {
+            request: originalInput,
+            message: e.message,
+            stack: e.stack,
+        });
     }
 }
 
@@ -310,6 +317,24 @@ function endProcessCommand(
     requestId: RequestId,
     context: CommandHandlerContext,
 ) {
+    const pendingToggleTransientAgents = context.pendingToggleTransientAgents;
+    if (pendingToggleTransientAgents.length !== 0) {
+        for (const [agentName, active] of pendingToggleTransientAgents) {
+            context.agents.toggleTransient(agentName, active);
+        }
+
+        // Changing active schemas, we need to clear the cache.
+        context.translatorCache.clear();
+
+        const [agentName, active] = pendingToggleTransientAgents.pop()!;
+        if (active) {
+            context.lastActionSchemaName = agentName;
+        } else if (context.lastActionSchemaName === agentName) {
+            context.lastActionSchemaName = getAppAgentName(agentName);
+        }
+        context.pendingToggleTransientAgents.length = 0; // clear the pending toggle agents.
+    }
+
     context.commandProfiler?.stop();
     context.commandProfiler = undefined;
 
@@ -346,36 +371,13 @@ export async function processCommand(
 
 export const enum unicodeChar {
     wood = "🪵",
-    robotFace = "🤖",
     constructionSign = "🚧",
     floppyDisk = "💾",
     stopSign = "🛑",
     convert = "🔄",
 }
-export function getSettingSummary(context: CommandHandlerContext) {
-    if (context.session.getConfig().request !== DispatcherName) {
-        const requestAgentName = context.session.getConfig().request;
-        return `{{${context.agents.getActionConfig(requestAgentName).emojiChar} ${requestAgentName.toUpperCase()}}}`;
-    }
-    const prompt: string[] = [unicodeChar.robotFace];
 
-    const names = context.agents.getActiveSchemas();
-    const ordered = names.filter(
-        (name) => name !== context.lastActionSchemaName,
-    );
-    if (ordered.length !== names.length) {
-        ordered.unshift(context.lastActionSchemaName);
-    }
-
-    const translators = Array.from(
-        new Set(
-            ordered.map(
-                (name) => context.agents.getActionConfig(name).emojiChar,
-            ),
-        ).values(),
-    );
-    prompt.push(":[", translators.join(""), "]");
-
+function getDispatcherStatusDetails(context: CommandHandlerContext) {
     const disabled = [];
 
     const config = context.session.getConfig();
@@ -394,6 +396,7 @@ export function getSettingSummary(context: CommandHandlerContext) {
         disabled.push(unicodeChar.wood);
     }
 
+    const prompt: string[] = [];
     if (disabled.length !== 0) {
         prompt.push(" ", unicodeChar.stopSign, ":[", ...disabled, "]");
     }
@@ -415,11 +418,42 @@ export function getSettingSummary(context: CommandHandlerContext) {
 
     return prompt.join("");
 }
+export function getDispatcherStatus(
+    context: CommandHandlerContext,
+): DispatcherStatus {
+    const names = new Set<string>();
+    const agents = context.agents.getActionConfigs().map((config) => {
+        const appAgentName = getAppAgentName(config.schemaName);
+        names.add(config.schemaName);
+        return {
+            emoji: config.emojiChar,
+            name: config.schemaName,
+            lastUsed: context.lastActionSchemaName === config.schemaName,
+            priority:
+                context.activityContext?.appAgentName === config.schemaName,
+            request: context.session.getConfig().request === config.schemaName,
+            active:
+                context.agents.isActionActive(config.schemaName) ||
+                context.agents.isCommandEnabled(appAgentName),
+        };
+    });
 
-export function getTranslatorNameToEmojiMap(context: CommandHandlerContext) {
-    return new Map<string, string>(Object.entries(context.agents.getEmojis()));
-}
+    // Make sure we include app agents that do not have actions.
+    for (const agentName of context.agents.getAppAgentNames()) {
+        if (!names.has(agentName)) {
+            agents.push({
+                emoji: context.agents.getAppAgentEmoji(agentName),
+                name: agentName,
+                lastUsed: false,
+                priority: false,
+                request: false,
+                active: context.agents.isCommandEnabled(agentName),
+            });
+        }
+    }
 
-export function getPrompt(context: CommandHandlerContext) {
-    return `${getSettingSummary(context)}> `;
+    return {
+        agents,
+        details: getDispatcherStatusDetails(context),
+    };
 }

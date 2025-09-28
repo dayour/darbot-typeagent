@@ -11,7 +11,7 @@ function remoteCallNotSupported(): never {
 }
 
 export function createDispatcherRpcClient(channel: RpcChannel): Dispatcher {
-    const rpc = createRpc<DispatcherInvokeFunctions>(channel);
+    const rpc = createRpc<DispatcherInvokeFunctions>("dispatcher", channel);
 
     return {
         async processCommand(command, requestId, attachments) {
@@ -48,10 +48,8 @@ export function createDispatcherRpcClient(channel: RpcChannel): Dispatcher {
             return rpc.invoke("getCommandCompletion", { prefix });
         },
         async close() {
-            return rpc.invoke("close", undefined);
+            return rpc.invoke("close");
         },
-        getPrompt: remoteCallNotSupported,
-        getSettingSummary: remoteCallNotSupported,
-        getTranslatorNameToEmojiMap: remoteCallNotSupported,
+        getStatus: remoteCallNotSupported,
     };
 }

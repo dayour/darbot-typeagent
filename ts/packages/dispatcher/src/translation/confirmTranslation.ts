@@ -14,8 +14,8 @@ import { getColorElapsedString } from "common-utils";
 import { getActionTemplateEditConfig } from "./actionTemplate.js";
 import { CommandHandlerContext } from "../context/commandHandlerContext.js";
 import { validateAction } from "action-schema";
-import { getActionSchema } from "./actionSchemaFileCache.js";
 import { DispatcherName } from "../context/dispatcher/dispatcherUtils.js";
+import { tryGetActionSchema } from "./actionSchemaFileCache.js";
 
 function validateReplaceActions(
     actions: unknown,
@@ -34,7 +34,7 @@ function validateReplaceActions(
         if (typeof action !== "object") {
             throw new Error("Invalid replacement");
         }
-        const actionInfo = getActionSchema(action, systemContext.agents);
+        const actionInfo = tryGetActionSchema(action, systemContext.agents);
         if (actionInfo === undefined) {
             throw new Error("Invalid replacement");
         }
@@ -51,7 +51,7 @@ export async function confirmTranslation(
     requestAction: RequestAction,
     context: ActionContext<CommandHandlerContext>,
 ): Promise<{
-    requestAction: RequestAction | undefined | null;
+    requestAction: RequestAction;
     replacedAction?: ExecutableAction[];
 }> {
     const actions = requestAction.actions;

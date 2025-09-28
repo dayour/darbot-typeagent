@@ -12,13 +12,16 @@ import {
     getDefaultAppAgentProviders,
     getDefaultConstructionProvider,
     getDefaultAppAgentInstaller,
+    getIndexingServiceRegistry,
 } from "default-agent-provider";
 import inspector from "node:inspector";
 import { getChatModelNames } from "aiclient";
 import {
+    getConsolePrompt,
     processCommands,
     withConsoleClientIO,
 } from "agent-dispatcher/helpers/console";
+import { getStatusSummary } from "agent-dispatcher/helpers/status";
 
 const modelNames = await getChatModelNames();
 const instanceDir = getInstanceDir();
@@ -80,9 +83,11 @@ export default class Interactive extends Command {
                 explainer: { name: flags.explainer },
                 persistSession: !flags.memory,
                 persistDir: !flags.memory ? getInstanceDir() : undefined,
-                enableServiceHost: true,
                 clientIO,
                 dblogging: true,
+                indexingServiceRegistry: await getIndexingServiceRegistry(
+                    !flags.memory ? getInstanceDir() : undefined,
+                ),
                 clientId: getClientId(),
                 constructionProvider: getDefaultConstructionProvider(),
             });
@@ -95,7 +100,12 @@ export default class Interactive extends Command {
                 }
 
                 await processCommands(
-                    () => dispatcher.getPrompt(),
+                    (dispatcher: Dispatcher) =>
+                        getConsolePrompt(
+                            getStatusSummary(dispatcher.getStatus(), {
+                                showPrimaryName: false,
+                            }),
+                        ),
                     (command: string, dispatcher: Dispatcher) =>
                         dispatcher.processCommand(command),
                     dispatcher,

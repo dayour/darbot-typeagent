@@ -29,7 +29,7 @@ import {
 } from "./types.js";
 import { createRpc } from "./rpc.js";
 import { ChannelProvider } from "./common.js";
-import { uint8ArrayToBase64 } from "common-utils";
+import { getObjectProperty, uint8ArrayToBase64 } from "common-utils";
 import { AgentInterfaceFunctionName } from "./server.js";
 
 type ShimContext =
@@ -38,35 +38,40 @@ type ShimContext =
       }
     | undefined;
 
-function createContextMap<T>() {
-    let nextContextId = 0;
-    let contextIdMap = new Map<T, number>();
-    let contextMap = new Map<number, T>();
+type ObjectMap<T = unknown> = {
+    getId(obj: T): number;
+    get(objId: number): T;
+    close(obj: T): void;
+};
+function createObjectMap<T = unknown>(): ObjectMap<T> {
+    let nextObjectId = 0;
+    let objectIdMap = new Map<T, number>();
+    let objectMap = new Map<number, T>();
 
-    function getId(context: T) {
-        let contextId = contextIdMap.get(context);
-        if (contextId === undefined) {
-            contextId = nextContextId++;
-            contextIdMap.set(context, contextId);
-            contextMap.set(contextId, context);
+    function getId(obj: T) {
+        let objectId = objectIdMap.get(obj);
+        if (objectId === undefined) {
+            objectId = nextObjectId++;
+            objectIdMap.set(obj, objectId);
+            objectMap.set(objectId, obj);
         }
-        return contextId;
+        return objectId;
     }
-    function get(contextId: number) {
-        const context = contextMap.get(contextId);
+    function get(objId: number) {
+        const context = objectMap.get(objId);
         if (context === undefined) {
             throw new Error(
-                `Internal error: Invalid contextId ${contextId}${contextId < nextContextId ? " used out of scope" : ""}`,
+                `Internal error: Invalid contextId ${objId}${objId < nextObjectId ? " used out of scope" : ""}`,
             );
         }
         return context;
     }
 
-    function close(context: T) {
-        const contextId = contextIdMap.get(context);
-        if (contextId !== undefined) {
-            contextIdMap.delete(context);
-            contextMap.delete(contextId);
+    function close(obj: T) {
+        const objId = objectIdMap.get(obj);
+        if (objId !== undefined) {
+            objectIdMap.delete(obj);
+            objectMap.delete(objId);
         }
     }
     return {
@@ -76,13 +81,74 @@ function createContextMap<T>() {
     };
 }
 
+function getOptionsFunctions(options?: any): string[] | undefined {
+    if (typeof options !== "object" || options === null) {
+        return undefined;
+    }
+    if (options.__proto__ !== null && options.__proto__ !== Object.prototype) {
+        // If the options is not a plain object, we cannot handle it
+        throw new Error(
+            "Options must be a plain object with no prototype or default prototype",
+        );
+    }
+    const funcs: string[] = [];
+    for (const [k, v] of Object.entries(options)) {
+        if (typeof v === "function") {
+            // Convert the function to a string to avoid circular references
+            funcs.push(k);
+            continue;
+        }
+        const valueFuncs = getOptionsFunctions(v);
+        if (valueFuncs !== undefined) {
+            for (const f of valueFuncs) {
+                funcs.push(`${k}.${f}`);
+            }
+        }
+    }
+    return funcs.length > 0 ? funcs : undefined;
+}
+
+function createOptionsRpc(channelProvider: ChannelProvider, name: string) {
+    const channel = channelProvider.createChannel(`options:${name}`);
+    const optionsMap = createObjectMap();
+    return {
+        optionsMap,
+        rpc: createRpc(name, channel, {
+            callback: async (param: {
+                id: number;
+                name: string;
+                args: any[];
+            }) => {
+                const options: any = optionsMap.get(param.id);
+                let thisObject: any = undefined;
+                let fn: (...args: any[]) => any;
+                const name = param.name;
+                if (name === "") {
+                    fn = options;
+                } else {
+                    const names = param.name.split(".");
+                    if (names.length === 1) {
+                        thisObject = options;
+                        fn = options[name];
+                    } else {
+                        const funcName = names.pop();
+                        thisObject = getObjectProperty(options, name);
+                        fn = thisObject[funcName!];
+                    }
+                }
+                return fn.call(thisObject, ...param.args);
+            },
+        }),
+    };
+}
+
 export async function createAgentRpcClient(
     name: string,
     channelProvider: ChannelProvider,
     agentInterface: AgentInterfaceFunctionName[],
 ) {
     const channel = channelProvider.createChannel(`agent:${name}`);
-    const contextMap = createContextMap<SessionContext<ShimContext>>();
+    const contextMap = createObjectMap<SessionContext<ShimContext>>();
     function getContextParam(
         context: SessionContext<ShimContext>,
     ): ContextParams {
@@ -94,7 +160,21 @@ export async function createAgentRpcClient(
         };
     }
 
-    const actionContextMap = createContextMap<ActionContext<ShimContext>>();
+    const actionContextMap = createObjectMap<ActionContext<ShimContext>>();
+    let optionsRpc: ReturnType<typeof createOptionsRpc> | undefined;
+    function getOptionsCallBack(options?: any) {
+        const functions = getOptionsFunctions(options);
+        if (functions === undefined) {
+            return undefined;
+        }
+        if (optionsRpc === undefined) {
+            optionsRpc = createOptionsRpc(channelProvider, name);
+        }
+        return {
+            id: optionsRpc.optionsMap.getId(options),
+            functions,
+        };
+    }
     function withActionContext<T>(
         actionContext: ActionContext<ShimContext>,
         fn: (contextParams: ActionContextParams) => T,
@@ -175,7 +255,7 @@ export async function createAgentRpcClient(
         }) => {
             const context = contextMap.get(param.contextId);
             await context.removeDynamicAgent(param.name);
-            channelProvider.deleteChannel(param.name);
+            channelProvider.deleteChannel(`agent:${param.name}`);
         },
         getSharedLocalHostPort: async (param: {
             contextId: number;
@@ -282,6 +362,14 @@ export async function createAgentRpcClient(
                 param.defaultId,
             );
         },
+        queueToggleTransientAgent: async (
+            contextId: number,
+            agentName: string,
+            active: boolean,
+        ) => {
+            const context = actionContextMap.get(contextId);
+            return context.queueToggleTransientAgent(agentName, active);
+        },
     };
 
     const agentContextCallHandlers: AgentContextCallFunctions = {
@@ -333,13 +421,16 @@ export async function createAgentRpcClient(
         AgentCallFunctions,
         AgentContextInvokeFunctions,
         AgentContextCallFunctions
-    >(channel, agentContextInvokeHandlers, agentContextCallHandlers);
+    >(name, channel, agentContextInvokeHandlers, agentContextCallHandlers);
 
     // The shim needs to implement all the APIs regardless whether the actual agent
     // has that API.  We remove remove it the one that is not necessary below.
     const agent: Required<AppAgent> = {
         initializeAgentContext(settings?: AppAgentInitSettings) {
-            return rpc.invoke("initializeAgentContext", settings);
+            return rpc.invoke("initializeAgentContext", {
+                settings,
+                optionsCallBack: getOptionsCallBack(settings?.options),
+            });
         },
         updateAgentContext(
             enable,
@@ -472,14 +563,16 @@ export async function createAgentRpcClient(
             });
         },
         getActionCompletion(
+            context: SessionContext<ShimContext>,
             partialAction,
             propertyName,
-            context: SessionContext<ShimContext>,
+            entityTypeName,
         ) {
             return rpc.invoke("getActionCompletion", {
                 ...getContextParam(context),
                 partialAction,
                 propertyName,
+                entityTypeName,
             });
         },
     };
@@ -491,6 +584,7 @@ export async function createAgentRpcClient(
 
     const invokeCloseAgentContext = result.closeAgentContext;
     result.closeAgentContext = async (context: SessionContext<ShimContext>) => {
+        // TODO: Clean up the associated options.
         const result = await invokeCloseAgentContext?.(context);
         contextMap.close(context);
         return result;

@@ -20,8 +20,9 @@ import {
     createIndexingEventHandler,
     loadEmailMemory,
     memoryNameToIndexPath,
+    setKnowledgeExtractorV2,
+    setKnowledgeTranslator,
 } from "./knowproCommon.js";
-import chalk from "chalk";
 
 export type KnowProEmailContext = {
     printer: KnowProPrinter;
@@ -54,6 +55,7 @@ export async function createKnowproEmailCommands(
             },
             options: {
                 updateIndex: argBool("Automatically update index", true),
+                v2: argBool("Use v2 knowledge extraction", false),
             },
         };
     }
@@ -88,15 +90,31 @@ export async function createKnowproEmailCommands(
             progress,
             emailsToAdd.length,
         );
-        const result = await emailMemory.addMessages(
-            emailsToAdd,
-            namedArgs.updateIndex,
-            eventHandler,
-        );
-        progress.complete();
-        if (!result.success) {
-            context.printer.writeError(result.message);
-            return;
+        let prevTranslator;
+        if (namedArgs.v2) {
+            context.printer.writeLine("Using v2 knowledge extractor");
+            prevTranslator = setKnowledgeExtractorV2(
+                emailMemory.settings.conversationSettings,
+            );
+        }
+        try {
+            const result = await emailMemory.addMessages(
+                emailsToAdd,
+                namedArgs.updateIndex,
+                eventHandler,
+            );
+            progress.complete();
+            if (!result.success) {
+                context.printer.writeError(result.message);
+                return;
+            }
+        } finally {
+            if (prevTranslator) {
+                setKnowledgeTranslator(
+                    emailMemory.settings.conversationSettings,
+                    prevTranslator,
+                );
+            }
         }
     }
 
@@ -138,7 +156,7 @@ export async function createKnowproEmailCommands(
             const result = await emailMemory.buildIndex(eventHandler);
             clock.stop();
             progress.complete();
-            context.printer.writeTiming(chalk.gray, clock, "Build index");
+            context.printer.writeTiming(clock, "Build index");
             if (!result.success) {
                 context.printer.writeError(result.message);
                 return;
@@ -179,7 +197,7 @@ export async function createKnowproEmailCommands(
         );
         clock.stop();
         if (context.email) {
-            context.printer.writeTiming(chalk.gray, clock);
+            context.printer.writeTiming(clock);
         } else {
             // Memory not found. Create a new one
             context.email = await loadEmailMemory(emailIndexPath, true);

@@ -20,7 +20,7 @@ export class KnowProPrinter extends MemoryConsoleWriter {
         writer: (printer: KnowProPrinter, item: any) => void,
     ) {
         for (let i = 0; i < array.length; ++i) {
-            this.write(`${i}. `);
+            this.write(`${i + 1}. `);
             writer(this, array[i]);
         }
         return this;
@@ -64,7 +64,7 @@ export class KnowProPrinter extends MemoryConsoleWriter {
         try {
             this.writeNameValue("Timestamp", message.timestamp);
             if (message.tags && message.tags.length > 0) {
-                this.writeList(message.tags, { type: "csv", title: "Tags" });
+                this.writeMessageTags(message.tags);
             }
             this.writeMetadata(message);
         } finally {
@@ -132,6 +132,24 @@ export class KnowProPrinter extends MemoryConsoleWriter {
         this.writeLine();
     }
 
+    public writeMessageTags(tags: string[] | kp.MessageTag[] | undefined) {
+        if (tags && tags.length > 0) {
+            const stringTags: string[] = tags.filter(
+                (t) => typeof t === "string",
+            ) as string[];
+            if (stringTags && stringTags.length > 0) {
+                this.writeList(stringTags, { type: "csv", title: "Tags" });
+            }
+            const sTags: kp.StructuredTag[] = tags.filter(
+                (t) => typeof t !== "string",
+            ) as kp.StructuredTag[];
+            if (sTags && sTags.length > 0) {
+                this.writeLine("Structured Tags:");
+                this.writeStructuredTags(sTags);
+            }
+        }
+    }
+
     public writeEntity(
         entity: knowLib.conversation.ConcreteEntity | undefined,
     ): KnowProPrinter {
@@ -146,6 +164,18 @@ export class KnowProPrinter extends MemoryConsoleWriter {
             }
         }
         return this;
+    }
+
+    public writeEntities(
+        entities: knowLib.conversation.ConcreteEntity[] | undefined,
+    ) {
+        if (entities && entities.length > 0) {
+            entities = kp.mergeConcreteEntities(entities);
+            entities.sort((x, y) => x.name.localeCompare(y.name));
+            this.writeNumbered(entities, (printer, ce) =>
+                printer.writeEntity(ce).writeLine(),
+            );
+        }
     }
 
     public writeAction(
@@ -171,12 +201,28 @@ export class KnowProPrinter extends MemoryConsoleWriter {
         return this;
     }
 
+    public writeTags(tags: kp.Tag[] | undefined) {
+        if (tags && tags.length > 0) {
+            let tagStrings = kp.mergeTags(tags);
+            tagStrings.sort();
+            this.writeList(tagStrings, { type: "ol" });
+        }
+        return this;
+    }
+
+    public writeStructuredTags(tags: kp.StructuredTag[] | undefined) {
+        return this.writeEntities(
+            tags as knowLib.conversation.ConcreteEntity[],
+        );
+    }
+
     public writeSemanticRef(semanticRef: kp.SemanticRef) {
         switch (semanticRef.knowledgeType) {
             default:
                 this.writeLine(semanticRef.knowledgeType);
                 break;
             case "entity":
+            case "sTag":
                 this.writeEntity(
                     semanticRef.knowledge as knowLib.conversation.ConcreteEntity,
                 );
@@ -188,6 +234,9 @@ export class KnowProPrinter extends MemoryConsoleWriter {
                 break;
             case "topic":
                 this.writeTopic(semanticRef.knowledge as kp.Topic);
+                break;
+            case "tag":
+                this.writeTag(semanticRef.knowledge as kp.Tag);
                 break;
         }
         return this;
@@ -267,7 +316,7 @@ export class KnowProPrinter extends MemoryConsoleWriter {
 
     public writeSemanticRefSearchResult(
         conversation: kp.IConversation,
-        result: kp.SemanticRefSearchResult | undefined,
+        result: kp.SemanticRefSearchResult,
         maxToDisplay: number,
     ) {
         if (result) {
@@ -300,6 +349,13 @@ export class KnowProPrinter extends MemoryConsoleWriter {
             results,
             maxToDisplay,
         );
+        this.writeKnowledgeSearchResult(
+            conversation,
+            "sTag",
+            results,
+            maxToDisplay,
+        );
+
         if (distinct) {
             this.writeResultDistinct(
                 conversation,
@@ -569,6 +625,11 @@ export class KnowProPrinter extends MemoryConsoleWriter {
         return this;
     }
 
+    public writeSearchQuery(searchQuery: kp.querySchema.SearchQuery) {
+        this.writeHeading("Search Query");
+        this.writeJson(searchQuery);
+    }
+
     public writeDebugContext(context: kp.LanguageSearchDebugContext) {
         if (context.searchQuery) {
             this.writeHeading("Search Query");
@@ -602,6 +663,37 @@ export class KnowProPrinter extends MemoryConsoleWriter {
                 this.writeError(answerResponse.whyNoAnswer);
             }
         }
+        return this;
+    }
+
+    public writeKnowledge(
+        knowledge?: knowLib.conversation.KnowledgeResponse | undefined,
+    ): void {
+        if (knowledge) {
+            if (knowledge.topics.length > 0) {
+                this.writeLineInColor(chalk.cyan, "Topics");
+                knowledge.topics.forEach((t) => this.writeLine(t));
+            }
+            if (knowledge.actions.length > 0) {
+                this.writeLineInColor(chalk.cyan, "Actions");
+                knowledge.actions.forEach((a) => this.writeAction(a));
+            }
+            if (knowledge.entities.length > 0) {
+                this.writeLineInColor(chalk.cyan, "Entities");
+                knowledge.entities.forEach((e) => this.writeEntity(e));
+            }
+        }
+    }
+
+    public writeDocPart(docPart: cm.DocPart) {
+        for (const text of docPart.textChunks) {
+            this.writeLine(text);
+        }
+        if (docPart.tags && docPart.tags.length > 0) {
+            this.writeLineInColor(chalk.cyan, "Tags");
+            this.writeMessageTags(docPart.tags);
+        }
+        this.writeKnowledge(docPart.knowledge);
         return this;
     }
 }

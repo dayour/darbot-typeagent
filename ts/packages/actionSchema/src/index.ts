@@ -12,6 +12,7 @@ export {
     ParsedActionSchema,
     ActionSchemaObject,
     ActionSchemaUnion,
+    SchemaObjectFields,
 } from "./type.js";
 
 export { parseActionSchemaSource } from "./parser.js";
@@ -28,8 +29,10 @@ export {
     ActionFunctionJsonSchema,
 } from "./jsonSchemaGenerator.js";
 export { validateAction } from "./validate.js";
+
+// Utils for any schemas
 export {
-    getParameterType,
+    getPropertyType,
     getParameterNames,
     resolveTypeReference,
     resolveUnionType,
@@ -47,7 +50,12 @@ export {
 export { validateType } from "./validate.js";
 
 // Schema Config
-export { SchemaConfig, ParamSpec, ActionParamSpecs } from "./schemaConfig.js";
+export {
+    SchemaConfig,
+    ParamSpec,
+    ActionParamSpecs,
+    CompletionEmojis,
+} from "./schemaConfig.js";
 
 // Legacy (to be deprecated)
 export { NodeType, SchemaParser, ISymbol, SymbolNode } from "./schemaParser.js";

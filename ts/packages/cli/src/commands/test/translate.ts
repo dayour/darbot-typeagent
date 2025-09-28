@@ -12,6 +12,7 @@ import { getInstanceDir } from "agent-dispatcher/helpers/data";
 import {
     getDefaultAppAgentProviders,
     getDefaultConstructionProvider,
+    getIndexingServiceRegistry,
 } from "default-agent-provider";
 import chalk from "chalk";
 import fs from "node:fs";
@@ -103,10 +104,8 @@ function getTokenUsageStr(usage: ai.CompletionUsageStats, count: number = 1) {
 export default class TestTranslateCommand extends Command {
     static args = {
         files: Args.string({
-            files: Args.string({
-                description:
-                    "List of test data files. Default to all test files in the config.json.",
-            }),
+            description:
+                "List of test data files. Default to all test files in the config.json.",
         }),
     };
     static flags = {
@@ -387,6 +386,8 @@ export default class TestTranslateCommand extends Command {
                 cache: { enabled: flags.cache },
                 collectCommandResult: true,
                 constructionProvider: defaultConstructionProvider,
+                indexingServiceRegistry:
+                    await getIndexingServiceRegistry(getInstanceDir()),
             });
             if (flags.cache) {
                 await dispatcher.processCommand("@const import -t");

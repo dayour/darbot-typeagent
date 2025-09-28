@@ -9,6 +9,10 @@ import typechat
 
 from ..aitools import auth
 from . import kplib
+from .interfaces import IKnowledgeExtractor
+
+
+# TODO: Move ModelWrapper and create_typechat_model() to aitools package.
 
 
 class ModelWrapper(typechat.TypeChatLanguageModel):
@@ -53,7 +57,7 @@ def create_typechat_model() -> typechat.TypeChatLanguageModel:
 class KnowledgeExtractor:
     model: typechat.TypeChatLanguageModel = field(default_factory=create_typechat_model)
     max_chars_per_chunk: int = 2048
-    merge_action_knowledge: int = True
+    merge_action_knowledge: bool = True
     # Not in the signature:
     translator: typechat.TypeChatJsonTranslator[kplib.KnowledgeResponse] = field(
         init=False
@@ -80,7 +84,7 @@ class KnowledgeExtractor:
         translator = typechat.TypeChatJsonTranslator[kplib.KnowledgeResponse](
             model, validator, kplib.KnowledgeResponse
         )
-        schema_text = translator._schema_str.rstrip()
+        schema_text = translator.schema_str.rstrip()
 
         def create_request_prompt(intent: str) -> str:
             return (
@@ -105,4 +109,4 @@ class KnowledgeExtractor:
         self, knowledge: kplib.KnowledgeResponse
     ) -> None:
         """Merge action knowledge into a single knowledge object."""
-        raise NotImplementedError  # TODO: Implement this method.
+        raise NotImplementedError("TODO")

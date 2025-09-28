@@ -7,10 +7,15 @@ import {
     JSONAction,
     ParamValueType,
 } from "../explanation/requestAction.js";
-import { ConstructionPart } from "./constructions.js";
-import { TransformInfo, isMatchPart, toTransformInfoKey } from "./matchPart.js";
+import { ConstructionPart, WildcardMode } from "./constructions.js";
+import {
+    TransformInfo,
+    getPropertyNameFromTransformInfo,
+    isMatchPart,
+    toTransformInfoKey,
+} from "./matchPart.js";
 import { ParsePart, isParsePart } from "./parsePart.js";
-import { MatchConfig } from "./constructionMatch.js";
+import { isWildcardEnabled, MatchConfig } from "./constructionMatch.js";
 
 export type MatchedValueTranslator = {
     transform(
@@ -28,9 +33,12 @@ export type MatchedValueTranslator = {
 export type MatchedValues = {
     values: [string, ParamValueType][];
     conflictValues: [string, ParamValueType[]][] | undefined;
+    entityWildcardPropertyNames: string[];
     matchedCount: number;
     wildcardCharCount: number;
+    partialPartCount?: number; // Only used for partial match
 };
+
 export function matchedValues(
     parts: ConstructionPart[],
     matched: string[],
@@ -38,7 +46,11 @@ export function matchedValues(
     matchValueTranslator: MatchedValueTranslator,
 ): MatchedValues | undefined {
     const matchedParts = parts.filter((e) => e.capture);
-    if (matchedParts.length !== matched.length) {
+    if (
+        config.partial
+            ? matched.length > matchedParts.length
+            : matchedParts.length !== matched.length
+    ) {
         throw new Error(
             "Internal error: number of matched parts doesn't equal match groups",
         );
@@ -47,15 +59,19 @@ export function matchedValues(
     const values: [string, ParamValueType][] = [];
     const conflictValues: [string, ParamValueType[]][] | undefined =
         config.conflicts ? [] : undefined;
+    const entityWildcardPropertyNames: string[] = [];
     let matchedCount = 0;
     let wildcardCharCount = 0;
 
-    const wildcardNames = new Set<string>();
     const matchedTransformText = new Map<
         string,
-        { transformInfo: TransformInfo; text: string[] }
+        {
+            transformInfo: TransformInfo;
+            text: string[];
+            wildcardMode: WildcardMode;
+        }
     >();
-    for (let i = 0; i < matchedParts.length; i++) {
+    for (let i = 0; i < matched.length; i++) {
         const part = matchedParts[i];
         const match = matched[i];
         if (isMatchPart(part)) {
@@ -66,11 +82,12 @@ export function matchedValues(
                 if (entry !== undefined) {
                     entry.text.push(match);
                 } else {
-                    entry = { transformInfo: info, text: [match] };
+                    entry = {
+                        transformInfo: info,
+                        text: [match],
+                        wildcardMode: part.wildcardMode,
+                    };
                     matchedTransformText.set(key, entry);
-                    if (config.enableWildcard && part.wildcardMode) {
-                        wildcardNames.add(key);
-                    }
                 }
             }
         } else if (isParsePart(part)) {
@@ -84,22 +101,28 @@ export function matchedValues(
         }
     }
 
-    for (const [key, matches] of matchedTransformText.entries()) {
-        // See if there are known entities
+    for (const matches of matchedTransformText.values()) {
+        const transformInfo = matches.transformInfo;
+
+        if (config.partial && matches.text.length !== transformInfo.partCount) {
+            // Partial match, so we don't have all the parts.  Just skip.
+            continue;
+        }
+
+        // Check existing values.
         const value = matchValueTranslator.transform(
-            matches.transformInfo,
+            transformInfo,
             matches.text,
             config.history,
         );
-        const { transformName, actionIndex } = matches.transformInfo;
-        const propertyName = `${actionIndex !== undefined ? `${actionIndex}.` : ""}${transformName}`;
+        const propertyName = getPropertyNameFromTransformInfo(transformInfo);
         if (value !== undefined) {
             values.push([propertyName, value]);
             matchedCount++;
 
             if (conflictValues !== undefined) {
                 const v = matchValueTranslator.transformConflicts?.(
-                    matches.transformInfo,
+                    transformInfo,
                     matches.text,
                 );
                 if (v !== undefined) {
@@ -110,15 +133,21 @@ export function matchedValues(
         }
 
         // Try wildcard
-        if (wildcardNames.has(key)) {
-            // Wildcard match
-            if (matches.text.length > 1) {
-                // TODO: Don't support multiple subphrase wildcard match for now.
-                return undefined;
-            }
+        if (
+            isWildcardEnabled(config, matches.wildcardMode) &&
+            // TODO: Don't support multiple subphrase wildcard match for now.
+            matches.text.length === 1
+        ) {
             const match = matches.text.join(" ");
             values.push([propertyName, match]);
-            wildcardCharCount += match.length;
+
+            if (matches.wildcardMode === WildcardMode.Entity) {
+                // Don't include entity wildcard in the wildcard char count
+                // It should be rejected if there is not a matched entity.
+                entityWildcardPropertyNames.push(propertyName);
+            } else {
+                wildcardCharCount += match.length;
+            }
             continue;
         }
 
@@ -127,6 +156,7 @@ export function matchedValues(
     }
     return {
         values,
+        entityWildcardPropertyNames,
         conflictValues,
         matchedCount,
         wildcardCharCount,
@@ -136,6 +166,7 @@ export function matchedValues(
 export function createActionProps(
     values: [string, ParamValueType][],
     emptyArrayParameters?: string[],
+    partial: boolean = false,
     initial?: JSONAction | JSONAction[],
 ) {
     const result: any = { actionProps: structuredClone(initial) };
@@ -150,17 +181,31 @@ export function createActionProps(
     }
 
     const actionProps = result.actionProps;
+
+    if (actionProps === undefined) {
+        if (partial) {
+            return { fullActionName: undefined }; // Return undefined for partial matches
+        }
+        throw new Error(
+            "Internal error: No values provided for action properties",
+        );
+    }
     // validate fullActionName
     if (Array.isArray(actionProps)) {
         actionProps.forEach((actionProp) => {
             if (actionProp.fullActionName === undefined) {
-                throw new Error("Internal error: fullActionName missing");
+                if (!partial) {
+                    throw new Error("Internal error: fullActionName missing");
+                }
+                // Leave undefined for partial matches
             }
         });
-    } else {
-        if (actionProps.fullActionName === undefined) {
+    } else if (actionProps.fullActionName === undefined) {
+        if (!partial) {
             throw new Error("Internal error: fullActionName missing");
         }
+        // Leave undefined for partial matches
     }
+
     return actionProps;
 }

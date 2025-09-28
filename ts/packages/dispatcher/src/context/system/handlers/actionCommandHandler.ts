@@ -4,22 +4,21 @@
 import {
     ActionContext,
     AppAction,
+    CompletionGroup,
     ParsedCommandParams,
     PartialParsedCommandParams,
     SessionContext,
+    TypeAgentAction,
 } from "@typeagent/agent-sdk";
 import { CommandHandler } from "@typeagent/agent-sdk/helpers/command";
 import { CommandHandlerContext } from "../../commandHandlerContext.js";
-import {
-    getParameterNames,
-    getParameterType,
-    validateAction,
-} from "action-schema";
+import { getParameterNames, validateAction } from "action-schema";
 import { executeActions } from "../../../execute/actionHandlers.js";
 import { FullAction, toExecutableActions } from "agent-cache";
-import { getActionSchema } from "../../../internal.js";
-import { getObjectProperty } from "common-utils";
-import { getActionCompletion } from "../../../translation/actionTemplate.js";
+import { DeepPartialUndefined, getObjectProperty } from "common-utils";
+import { getActionParamCompletion } from "../../../translation/requestCompletion.js";
+import { getActionSchema } from "../../../translation/actionSchemaUtils.js";
+import { tryGetActionSchema } from "../../../translation/actionSchemaFileCache.js";
 
 export class ActionCommandHandler implements CommandHandler {
     public readonly description = "Execute an action";
@@ -52,14 +51,7 @@ export class ActionCommandHandler implements CommandHandler {
             throw new Error(`Invalid schema name ${schemaName}`);
         }
 
-        const actionSchema =
-            actionSchemaFile.parsedActionSchema.actionSchemas.get(actionName);
-        if (actionSchema === undefined) {
-            throw new Error(
-                `Invalid action name ${actionName} for schema ${schemaName}`,
-            );
-        }
-
+        const actionSchema = getActionSchema(actionSchemaFile, actionName);
         const action: AppAction = {
             schemaName: schemaName,
             actionName,
@@ -81,13 +73,16 @@ export class ActionCommandHandler implements CommandHandler {
         context: SessionContext<CommandHandlerContext>,
         params: PartialParsedCommandParams<typeof this.parameters>,
         names: string[],
-    ): Promise<string[]> {
+    ): Promise<CompletionGroup[]> {
         const systemContext = context.agentContext;
-        const completions: string[] = [];
+        const completions: CompletionGroup[] = [];
         for (const name of names) {
             if (name === "schemaName") {
                 const schemaNames = systemContext.agents.getActiveSchemas();
-                completions.push(...schemaNames);
+                completions.push({
+                    name,
+                    completions: schemaNames,
+                });
                 continue;
             }
 
@@ -101,9 +96,12 @@ export class ActionCommandHandler implements CommandHandler {
                 if (actionSchemaFile === undefined) {
                     continue;
                 }
-                completions.push(
-                    ...actionSchemaFile.parsedActionSchema.actionSchemas.keys(),
-                );
+                completions.push({
+                    name,
+                    completions: Array.from(
+                        actionSchemaFile.parsedActionSchema.actionSchemas.keys(),
+                    ),
+                });
                 continue;
             }
 
@@ -114,7 +112,7 @@ export class ActionCommandHandler implements CommandHandler {
                     actionName: params.args?.actionName,
                     parameters: params.flags?.parameters,
                 };
-                const actionInfo = getActionSchema(
+                const actionInfo = tryGetActionSchema(
                     action,
                     systemContext.agents,
                 );
@@ -128,44 +126,36 @@ export class ActionCommandHandler implements CommandHandler {
                     actionInfo,
                     getCurrentValue,
                 );
-                completions.push(
-                    ...parameterNames
+                completions.push({
+                    name,
+                    completions: parameterNames
                         .filter((p) => getCurrentValue(p) === undefined)
                         .map((p) => `--${p}`),
-                );
+                });
                 continue;
             }
 
             if (name.startsWith("--parameters.")) {
                 // complete the flag values for json properties
 
-                const action = {
+                const action: DeepPartialUndefined<TypeAgentAction> = {
                     schemaName: params.args?.schemaName,
                     actionName: params.args?.actionName,
                     parameters: params.flags?.parameters,
                 };
 
-                const actionSchema = getActionSchema(
+                const parameterCompletion = await getActionParamCompletion(
+                    systemContext,
                     action,
-                    systemContext.agents,
+                    name.substring("--parameters.".length),
                 );
-                if (actionSchema === undefined) {
-                    continue;
-                }
-                const propertyName = name.substring(2);
-                const fieldType = getParameterType(actionSchema, propertyName);
-                if (fieldType?.type === "string-union") {
-                    completions.push(...fieldType.typeEnum);
-                    continue;
-                }
 
-                completions.push(
-                    ...(await getActionCompletion(
-                        systemContext,
-                        action as Partial<AppAction>,
-                        propertyName,
-                    )),
-                );
+                if (parameterCompletion) {
+                    completions.push({
+                        name,
+                        ...parameterCompletion,
+                    });
+                }
 
                 continue;
             }

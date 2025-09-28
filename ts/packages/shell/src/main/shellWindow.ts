@@ -6,7 +6,6 @@ import {
     DevicePermissionHandlerHandlerDetails,
     globalShortcut,
     ipcMain,
-    shell,
     WebContents,
     WebContentsView,
 } from "electron";
@@ -14,118 +13,238 @@ import path from "node:path";
 import { WebSocketMessageV2 } from "common-utils";
 import { runDemo } from "./demo.js";
 import {
-    ShellSettings,
     ShellUserSettings,
     ShellWindowState,
     ShellSettingManager,
+    BrowserTabState,
 } from "./shellSettings.js";
-import { debugShellError } from "./debug.js";
-import { isProd } from "./index.js";
+import { loadLocalWebContents } from "./utils.js";
+import { BrowserAgentIpc } from "./browserIpc.js";
+import {
+    BrowserViewManager,
+    BrowserViewContext,
+} from "./browserViewManager.js";
 
-const userAgent =
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 Edg/124.0.0.0";
+import registerDebug from "debug";
+import { ChatServer } from "./chatServer.js";
+
+const debugShellWindow = registerDebug("typeagent:shell:window");
+const debugShellWindowError = registerDebug("typeagent:shell:window:error");
+
 const isMac = process.platform === "darwin";
-
-export class ShellWindow {
-    public static getInstance(): ShellWindow | undefined {
-        return this.instance;
+const isLinux = process.platform === "linux";
+const TITLE_BAR_HEIGHT = isMac ? 36 : 40; // Custom title bar height
+function setupResizeHandler(mainWindow: BrowserWindow, handler: () => void) {
+    let scheduleHandler: (() => void) | undefined;
+    let timeout: NodeJS.Timeout | undefined;
+    mainWindow.on("resize", handler);
+    if (isLinux) {
+        // Workaround for electron bug where getContentSize isn't updated when "resize" event is fired
+        // https://github.com/electron/electron/issues/42586
+        scheduleHandler = () => {
+            debugShellWindow("Scheduled Maximize/Unmaximize update");
+            timeout = setTimeout(() => {
+                timeout = undefined;
+                debugShellWindow(
+                    "Running scheduled Maximize/Unmaximize update",
+                );
+                handler();
+            }, 100);
+        };
+        mainWindow.on("maximize", scheduleHandler);
+        mainWindow.on("unmaximize", scheduleHandler);
     }
-    private static instance: ShellWindow | undefined;
 
+    // Clean up function for close
+    return () => {
+        clearTimeout(timeout);
+        mainWindow.removeListener("resize", handler);
+        if (scheduleHandler !== undefined) {
+            mainWindow.removeListener("maximize", scheduleHandler);
+            mainWindow.removeListener("unmaximize", scheduleHandler);
+        }
+    };
+}
+
+type BottomAlignedPosition = { left: number; bottom: number };
+type OverlayData = BottomAlignedPosition & {
+    width: number;
+    height: number;
+};
+
+const dividerSize = 4; // 4px divider
+export class ShellWindow {
     public readonly mainWindow: BrowserWindow;
     public readonly chatView: WebContentsView;
-    private inlineWebContentView: WebContentsView | undefined;
-    private targetUrl: string | undefined;
-    private inlineWidth: number;
+    private readonly overlayWebContentsViews: Map<
+        WebContentsView,
+        OverlayData
+    > = new Map();
+
+    private verticalLayout: boolean;
+    private contentVisible: boolean = false;
+    // For use in horizontal layout
+    private chatWidth: number;
+    private contentWidth: number; // does not include dividerSize
+    private windowHeight: number; // includes TITLE_BAR_HEIGHT
+
+    // For use in vertical layout
+    private chatHeight: number;
+    private contentHeight: number; // does not include dividerSize
+    private windowWidth: number;
+
     private readonly contentLoadP: Promise<void>[];
     private readonly handlers = new Map<string, (event: any) => void>();
-    private readonly settings: ShellSettingManager;
-    private dispatcherReady: boolean = false;
-    private retryCount: number = 0;
+    private readyP = Promise.withResolvers<void>();
+    private browserTabRestored = false;
     private closing: boolean = false;
-    constructor(shellSettings: ShellSettings, instanceDir: string) {
-        if (ShellWindow.instance !== undefined) {
-            throw new Error("ShellWindow already created");
+
+    // Multi-tab browser support
+    private readonly browserViewManager: BrowserViewManager;
+
+    // Chat as a tab support
+    public chatViewServer: ChatServer | undefined;
+
+    public get inlineBrowser(): WebContentsView {
+        // Always use multi-tab browser
+        const activeBrowserView =
+            this.browserViewManager.getActiveBrowserView();
+        if (!activeBrowserView) {
+            throw new Error("No browser tab is open");
         }
-        this.settings = new ShellSettingManager(shellSettings, instanceDir);
+        return activeBrowserView.webContentsView;
+    }
 
-        this.inlineWidth = shellSettings.window.inlineWidth;
+    constructor(private readonly settings: ShellSettingManager) {
+        const state = this.settings.window;
+        this.chatWidth = state.chatWidth;
+        this.chatHeight = state.chatHeight;
+        this.contentWidth = state.contentWidth;
+        this.contentHeight = state.contentHeight;
+        this.windowWidth = state.windowWidth;
+        this.windowHeight = state.windowHeight;
 
-        const state = shellSettings.window;
-        const mainWindow = createMainWindow(state);
+        const uiSettings = this.settings.user.ui;
+        // Calculate the initial window bound.
+        this.verticalLayout = uiSettings.verticalLayout;
+        const mainWindow = createMainWindow();
 
         setupDevicePermissions(mainWindow);
-        this.setupWebContents(mainWindow.webContents);
 
+        // Initialize browser view manager
+        this.browserViewManager = new BrowserViewManager(this);
+
+        // Set up event callbacks for browser view manager
+        this.browserViewManager.setTabUpdateCallback(() => {
+            this.sendTabsUpdate();
+        });
+
+        this.browserViewManager.setNavigationUpdateCallback(() => {
+            this.sendNavigationUpdate();
+        });
+
+        this.browserViewManager.setPageLoadCompleteCallback((tabId: string) => {
+            // Only restore focus if this is the active tab
+            const activeTab = this.browserViewManager.getActiveBrowserView();
+            if (activeTab && activeTab.id === tabId) {
+                this.focusChatInput();
+            }
+        });
+
+        const resizeHandlerCleanup = setupResizeHandler(mainWindow, () =>
+            this.updateContentSize(),
+        );
         mainWindow.on("close", () => {
             this.cleanup();
             this.settings.save(this.getWindowState());
 
             mainWindow.hide();
-            mainWindow.removeAllListeners("move");
-            mainWindow.removeAllListeners("moved");
-            mainWindow.removeAllListeners("resize");
-            mainWindow.removeAllListeners("resized");
-
-            this.closeInlineBrowser(false);
+            // Remove the handler to avoid update the content size on close
+            resizeHandlerCleanup();
+            // Close all browser tabs on window close
+            this.browserViewManager.cleanup();
         });
-
-        mainWindow.on("closed", () => {
-            ShellWindow.instance = undefined;
-        });
-
-        mainWindow.on("resize", () => this.updateContentSize());
 
         const chatView = createChatView(state);
-        this.setupWebContents(chatView.webContents);
+        this.setupZoomHandlers(chatView.webContents, (zoomFactor) => {
+            this.updateOverlayBounds();
+            this.updateZoomInTitle(zoomFactor);
+        });
+
+        chatView.webContents.on("focus", () => {
+            this.setOverlayVisibility(true);
+        });
+
         mainWindow.contentView.addChildView(chatView);
 
         this.mainWindow = mainWindow;
         this.chatView = chatView;
 
-        this.installHandler("dom ready", () => {
-            this.ready();
+        this.installHandler("chat-view-ready", () => {
+            this.ready({ x: state.x, y: state.y });
         });
 
-        const contentLoadP: Promise<void>[] = [];
-        // HMR for renderer base on electron-vite cli.
-        // Load the remote URL for development or the local html file for production.
-        if (!isProd && process.env["ELECTRON_RENDERER_URL"]) {
-            contentLoadP.push(
-                chatView.webContents.loadURL(
-                    process.env["ELECTRON_RENDERER_URL"],
-                ),
-            );
-        } else {
-            contentLoadP.push(
-                chatView.webContents.loadFile(
-                    path.join(__dirname, "../renderer/index.html"),
-                ),
-            );
+        // Browser tab management IPC handlers
+        ipcMain.on("browser-new-tab", () => {
+            this.createBrowserTab();
+        });
+
+        ipcMain.on("browser-close-tab", (_, tabId: string) => {
+            const success = this.closeBrowserTab(tabId);
+            if (success) {
+                this.sendTabsUpdate();
+
+                // Update layout if no tabs left
+                if (!this.hasBrowserTabs()) {
+                    this.updateWindowBounds(this.getWindowPositionState());
+                }
+
+                // Restore focus to chat after closing tab
+                this.focusChatInput();
+            }
+        });
+
+        ipcMain.on("browser-switch-tab", (_, tabId: string) => {
+            const success = this.switchBrowserTab(tabId);
+            if (success) {
+                this.sendTabsUpdate();
+            }
+        });
+
+        ipcMain.on("browser-go-back", () => {
+            if (this.browserGoBack()) {
+                this.sendNavigationUpdate();
+            }
+        });
+
+        ipcMain.on("browser-go-forward", () => {
+            if (this.browserGoForward()) {
+                this.sendNavigationUpdate();
+            }
+        });
+
+        ipcMain.on("browser-reload", () => {
+            this.browserReload();
+        });
+
+        if (!isLinux) {
+            // REVIEW: on linux, setting windows bound before showing has not affect?
+            this.updateWindowBounds({ x: state.x, y: state.y });
         }
 
+        const contentLoadP: Promise<void>[] = [];
         contentLoadP.push(
-            mainWindow.webContents.loadFile(
-                path.join(__dirname, "../renderer/viewHost.html"),
-            ),
+            loadLocalWebContents(chatView.webContents, "chatView.html"),
         );
 
+        contentLoadP.push(
+            loadLocalWebContents(mainWindow.webContents, "viewHost.html"),
+        );
         this.contentLoadP = contentLoadP;
-
-        this.updateContentSize();
-        ShellWindow.instance = this;
     }
 
-    public async waitForContentLoaded() {
-        try {
-            await Promise.all(this.contentLoadP);
-        } catch (e) {
-            if (this.closing) {
-                // Ignore errors if the window is closing
-                return;
-            }
-            throw e;
-        }
+    public waitForReady(): Promise<void> {
+        return this.readyP.promise;
     }
 
     public showAndFocus() {
@@ -133,44 +252,141 @@ export class ShellWindow {
             return;
         }
         this.mainWindow.show();
-        this.mainWindow.focus();
+        this.focusChatInput();
     }
 
-    private ready() {
-        // Send settings asap
-        this.sendUserSettingChanged();
+    private focusChatInput() {
+        this.chatView.webContents.focus();
+        this.chatView.webContents.send("focus-chat-input");
+    }
 
-        const mainWindow = this.mainWindow;
-        mainWindow.show();
-        // Main window shouldn't zoom, otherwise the divider position won't be correct.  Setting it here just to make sure.
-        mainWindow.webContents.zoomFactor = 1;
-
+    private async restoreBrowserTabs() {
+        // Restore browser tabs if they were previously open
         const states = this.settings.window;
-        const user = this.settings.user;
-        if (states.devTools) {
-            this.chatView.webContents.openDevTools();
-        }
-
-        // open the canvas if it was previously open
-        if (user.canvas) {
+        if (states.browserTabsJson) {
             try {
-                this.openInlineBrowser(new URL(user.canvas));
+                const browserTabsState: BrowserTabState[] = JSON.parse(
+                    states.browserTabsJson,
+                );
+                debugShellWindow(
+                    `Restoring ${browserTabsState.length} browser tabs`,
+                );
+
+                // Restore each tab
+                for (const tabState of browserTabsState) {
+                    try {
+                        const tabId = await this.createBrowserTab(
+                            new URL(tabState.url),
+                            {
+                                background: !tabState.isActive,
+                            },
+                        );
+                        debugShellWindow(
+                            `Restored tab: ${tabId} - ${tabState.title} (${tabState.url})`,
+                        );
+                    } catch (e) {
+                        debugShellWindowError(
+                            `Failed to restore tab ${tabState.title} (${tabState.url}): ${e}`,
+                        );
+                    }
+                }
             } catch (e) {
-                // Don't care if this failed.
-                debugShellError(
-                    `Failed to open canvas URL ${user.canvas} on app start: ${e}`,
+                debugShellWindowError(
+                    `Failed to parse browser tabs JSON: ${e}`,
                 );
             }
         }
 
-        globalShortcut.register("Alt+Right", () => {
-            this.chatView.webContents.send("send-demo-event", "Alt+Right");
-        });
+        this.browserTabRestored = true;
+        this.ensureAutoEmptyTab();
     }
 
-    private setupWebContents(webContents: WebContents) {
-        this.setupZoomHandlers(webContents);
-        webContents.setUserAgent(userAgent);
+    private async ensureAutoEmptyTab() {
+        if (
+            this.contentVisible &&
+            !this.hasBrowserTabs() &&
+            this.settings.user.ui.autoEmptyTab &&
+            this.browserTabRestored &&
+            !this.closing
+        ) {
+            await this.createBrowserTab();
+        }
+    }
+
+    private async ready(position: { x: number; y: number }) {
+        try {
+            // Send settings asap
+            this.sendUserSettingChanged();
+            globalShortcut.register("Alt+Right", () => {
+                this.chatView.webContents.send("send-demo-event", "Alt+Right");
+            });
+
+            // Register Ctrl+L / Cmd+L and Ctrl+E / Cmd+E to focus chat input
+            globalShortcut.register("CommandOrControl+L", () => {
+                this.showAndFocus();
+            });
+
+            globalShortcut.register("CommandOrControl+E", () => {
+                this.showAndFocus();
+            });
+
+            // Make sure content is loaded so we can adjust the size including the divider.
+            await Promise.all(this.contentLoadP);
+            await this.restoreBrowserTabs();
+
+            if (!isLinux) {
+                // REVIEW: on linux, setting windows bound before showing has not affect?
+                this.updateContentSize();
+            }
+
+            const mainWindow = this.mainWindow;
+            this.setZoomFactor(1, mainWindow.webContents);
+            this.showAndFocus();
+
+            if (isLinux) {
+                // REVIEW: on linux, setting windows bound before showing has not affect?
+                this.updateWindowBounds(position);
+            }
+
+            const states = this.settings.window;
+            if (states.devTools) {
+                this.chatView.webContents.openDevTools();
+            }
+            this.readyP.resolve();
+        } catch (e) {
+            if (!this.closing) {
+                this.readyP.reject(e);
+            }
+        }
+    }
+
+    /**
+     * Starts the chat server
+     * @param port - The port upon which to start the chat server
+     */
+    public startChatServer(port: number) {
+        if (this.chatViewServer !== undefined) {
+            debugShellWindow("Chat server already started");
+            return;
+        }
+
+        if (port > 0) {
+            this.chatViewServer = new ChatServer(port);
+            this.chatViewServer.onConnection(async (ws: WebSocket) => {
+                // when a new connection is established send the chat log to the client
+                try {
+                    const html: string =
+                        await this.chatView.webContents.executeJavaScript(
+                            `document.getElementById('wrapper').innerHTML`,
+                        );
+                    ws.send(html);
+                } catch (error) {
+                    console.error("Error sending chat log:", error);
+                    ws.send(JSON.stringify(error));
+                }
+            });
+            this.chatViewServer.start();
+        }
     }
 
     private installHandler(name: string, handler: (event: any) => void) {
@@ -185,11 +401,54 @@ export class ShellWindow {
         }
         this.handlers.clear();
 
+        // Clean up browser IPC handlers
+        ipcMain.removeAllListeners("browser-new-tab");
+        ipcMain.removeAllListeners("browser-close-tab");
+        ipcMain.removeAllListeners("browser-switch-tab");
+        ipcMain.removeAllListeners("browser-go-back");
+        ipcMain.removeAllListeners("browser-go-forward");
+        ipcMain.removeAllListeners("browser-reload");
+
         globalShortcut.unregister("Alt+Right");
+        globalShortcut.unregister("CommandOrControl+L");
+        globalShortcut.unregister("CommandOrControl+E");
+
+        // shutdown chat server
+        if (this.chatViewServer) {
+            this.chatViewServer.stop();
+        }
+    }
+
+    public minimize() {
+        this.mainWindow.minimize();
+    }
+
+    public toggleMaximize() {
+        if (this.mainWindow.isMaximized()) {
+            this.mainWindow.unmaximize();
+        } else {
+            this.mainWindow.maximize();
+        }
+    }
+
+    public async close() {
+        if (this.mainWindow.isDestroyed()) {
+            return;
+        }
+        if (!this.closing) {
+            this.mainWindow.close();
+        }
+        return new Promise<void>((resolve) => {
+            this.mainWindow.once("closed", () => {
+                resolve();
+            });
+        });
     }
 
     public sendMessageToInlineWebContent(message: WebSocketMessageV2) {
-        this.inlineWebContentView?.webContents.send(
+        const activeBrowserView =
+            this.browserViewManager.getActiveBrowserView();
+        activeBrowserView?.webContentsView.webContents.send(
             "received-from-browser-ipc",
             message,
         );
@@ -214,25 +473,78 @@ export class ShellWindow {
     public setUserSettingValue(name: string, value: unknown) {
         const changed = this.settings.setUserSettingValue(name, value);
         if (changed) {
+            // Overly general test for need to update window size,
+            // as some of the UI settings doesn't need to update the window size
+            if (name.startsWith("ui")) {
+                const position = this.getWindowPositionState();
+                this.verticalLayout = this.settings.user.ui.verticalLayout;
+                this.updateWindowBounds(position);
+            }
             this.sendUserSettingChanged();
             this.settings.save(this.getWindowState());
         }
         return changed;
     }
 
-    private getWindowState(): ShellWindowState {
-        const position = this.mainWindow.getPosition();
-        const size = this.mainWindow.getSize();
+    private getWindowPositionState(): { x: number; y: number } {
+        // get the window position
+        const bounds = this.mainWindow.getNormalBounds();
+        const addContent = this.verticalLayout && !this.contentVisible;
 
         return {
-            x: position[0],
-            y: position[1],
-            width: size[0] - (this.inlineWebContentView ? this.inlineWidth : 0),
-            height: size[1],
-            inlineWidth: this.inlineWidth,
+            x: bounds.x,
+            y: addContent
+                ? bounds.y - this.contentHeight - dividerSize
+                : bounds.y,
+        };
+    }
+    public getWindowState(): ShellWindowState {
+        // Get browser tabs state for saving
+        const browserTabs = this.browserViewManager.getAllBrowserTabs();
+        const activeBrowserView =
+            this.browserViewManager.getActiveBrowserView();
+
+        const browserTabsState: BrowserTabState[] | undefined =
+            browserTabs.length > 0
+                ? browserTabs.map((tab) => ({
+                      id: tab.id,
+                      url: tab.url,
+                      title: tab.title,
+                      isActive: tab.isActive,
+                  }))
+                : undefined;
+
+        const browserTabsJson = browserTabsState
+            ? JSON.stringify(browserTabsState)
+            : undefined;
+
+        return {
+            ...this.getWindowPositionState(),
+            chatWidth: this.chatWidth,
+            chatHeight: this.chatHeight,
+            contentWidth: this.contentWidth,
+            contentHeight: this.contentHeight,
+            windowWidth: this.windowWidth,
+            windowHeight: this.windowHeight,
             zoomLevel: this.chatView.webContents.zoomFactor,
             devTools: this.chatView.webContents.isDevToolsOpened(),
+            canvas: this.browserViewManager.getActiveBrowserView()?.url, // Save active tab URL
+            browserTabsJson: browserTabsJson,
+            activeBrowserTabId: activeBrowserView?.id,
         };
+    }
+
+    public setWindowState(settings: ShellWindowState) {
+        this.mainWindow.setBounds({
+            x: settings.x,
+            y: settings.y,
+            width: settings.windowWidth,
+            height: settings.windowHeight,
+        });
+
+        this.setZoomFactor(settings.zoomLevel, this.chatView.webContents);
+
+        this.settings.save(this.getWindowState());
     }
 
     private sendUserSettingChanged() {
@@ -242,39 +554,116 @@ export class ShellWindow {
     // ================================================================
     // UI
     // ================================================================
-    public updateContentSize(newChatWidth?: number) {
+    public updateContentSize(newDividerPos?: number) {
         const bounds = this.mainWindow.getContentBounds();
-        const { width, height } = bounds;
-        let chatWidth = width;
-        if (this.inlineWebContentView) {
-            chatWidth = newChatWidth ?? this.chatView.getBounds().width;
-            if (chatWidth < 0) {
-                chatWidth = 0;
-            } else if (chatWidth > width - 4) {
-                chatWidth = width - 4;
-            }
-            const inlineWidth = width - chatWidth;
-            this.inlineWidth = inlineWidth;
-            this.inlineWebContentView.setBounds({
-                x: chatWidth + 4,
-                y: 0,
-                width: inlineWidth,
-                height: height,
-            });
-        }
+        debugShellWindow(
+            `Updating content size with window content bound: ${JSON.stringify(bounds)}`,
+        );
 
-        this.chatView.setBounds({
-            x: 0,
-            y: 0,
-            width: chatWidth,
-            height: height,
-        });
+        const verticalLayout = this.verticalLayout;
+        const { width, height } = bounds;
+        const availableHeight = height - TITLE_BAR_HEIGHT; // Account for title bar
+
+        let dividerPos = -1;
+        let chatViewBounds: Electron.Rectangle;
+        if (verticalLayout) {
+            this.windowWidth = width;
+
+            let chatHeight = height;
+            if (this.contentVisible) {
+                // Keep existing chat height unless the divider position changed.
+                chatHeight =
+                    newDividerPos !== undefined
+                        ? availableHeight - newDividerPos - dividerSize
+                        : this.chatHeight;
+
+                // Clamp for window resize.
+                if (chatHeight < 0) {
+                    chatHeight = 0;
+                } else {
+                    const maxHeight = availableHeight - dividerSize;
+                    if (chatHeight > maxHeight) {
+                        chatHeight = maxHeight;
+                    }
+                }
+
+                const contentHeight =
+                    availableHeight - chatHeight - dividerSize;
+                this.contentHeight = contentHeight;
+                dividerPos = contentHeight;
+
+                const browserViewBounds = {
+                    x: 0,
+                    y: TITLE_BAR_HEIGHT,
+                    width: width,
+                    height: contentHeight,
+                };
+
+                // Update browser view manager for multi-tab layout
+                this.browserViewManager.setBounds(browserViewBounds);
+            }
+            this.chatHeight = chatHeight;
+
+            chatViewBounds = {
+                x: 0,
+                y: TITLE_BAR_HEIGHT + availableHeight - chatHeight,
+                width,
+                height: chatHeight,
+            };
+        } else {
+            this.windowHeight = height;
+            let chatWidth = width;
+
+            if (this.contentVisible) {
+                // Keep existing chat width unless the divider position changed.
+                chatWidth = newDividerPos ?? this.chatWidth;
+
+                // Clamp for window resize.
+                if (chatWidth < 0) {
+                    chatWidth = 0;
+                } else {
+                    const maxWidth = width - dividerSize;
+                    if (chatWidth > maxWidth) {
+                        chatWidth = maxWidth;
+                    }
+                }
+                const contentWidth = width - chatWidth - dividerSize;
+                this.contentWidth = contentWidth;
+                dividerPos = chatWidth;
+
+                const browserViewBounds = {
+                    x: dividerPos + dividerSize,
+                    y: TITLE_BAR_HEIGHT,
+                    width: contentWidth,
+                    height: availableHeight,
+                };
+
+                // Update browser view manager for multi-tab layout
+                this.browserViewManager.setBounds(browserViewBounds);
+            }
+
+            this.chatWidth = chatWidth;
+
+            chatViewBounds = {
+                x: 0,
+                y: TITLE_BAR_HEIGHT,
+                width: chatWidth,
+                height: availableHeight,
+            };
+        }
+        debugShellWindow(`Chat view bounds: ${JSON.stringify(chatViewBounds)}`);
+        this.chatView.setBounds(chatViewBounds);
+
+        this.updateOverlayBounds();
+
+        const dividerLayout = {
+            verticalLayout,
+            pos: dividerPos,
+        };
 
         // Set the divider position
-        this.mainWindow.webContents.send(
-            "set-divider-left",
-            this.inlineWebContentView ? chatWidth : -1,
-        );
+        debugShellWindow("Divider Pos", dividerLayout);
+        this.mainWindow.webContents.send("set-layout", dividerLayout);
     }
 
     public toggleTopMost() {
@@ -285,133 +674,377 @@ export class ShellWindow {
         this.chatView.webContents.send("show-dialog", dialogName);
     }
 
-    public get inlineBrowserUrl(): string | undefined {
-        return this.targetUrl;
+    // ================================================================
+    // Multi-Tab Browser Support
+    // ================================================================
+
+    /**
+     * Resolve custom typeagent-browser protocol URLs
+     */
+    public resolveCustomProtocolUrl(targetUrl: URL): URL {
+        const browserExtensionUrls = (global as any).browserExtensionUrls;
+        if (browserExtensionUrls) {
+            // Map custom protocol to actual extension URL
+            const libraryName = targetUrl.pathname;
+
+            if (libraryName && browserExtensionUrls[libraryName]) {
+                const resolvedUrl = new URL(browserExtensionUrls[libraryName]);
+                debugShellWindow(
+                    `Resolved custom protocol URL: ${targetUrl.toString()} -> ${resolvedUrl.toString()}`,
+                );
+                return resolvedUrl;
+            } else {
+                throw new Error(`Unknown library page: ${libraryName}`);
+            }
+        } else {
+            throw new Error(
+                "Browser extension not loaded - library pages unavailable",
+            );
+        }
     }
-    // ================================================================
-    // Inline browser
-    // ================================================================
-    public openInlineBrowser(targetUrl: URL) {
-        const mainWindow = this.mainWindow;
-        const mainWindowSize = mainWindow.getBounds();
-        let newWindow: boolean = false;
-        let inlineWebContentView = this.inlineWebContentView;
-        if (!inlineWebContentView) {
-            newWindow = true;
 
-            inlineWebContentView = new WebContentsView({
-                webPreferences: {
-                    preload: path.join(__dirname, "../preload-cjs/webview.cjs"),
-                    sandbox: false,
-                    zoomFactor: this.chatView.webContents.zoomFactor,
-                },
-            });
+    private computeWindowBounds(
+        position: { x: number; y: number },
+        hasBrowserTabs: boolean,
+    ) {
+        const uiSettings = this.settings.user.ui;
+        let bounds: Electron.Rectangle;
+        if (this.verticalLayout) {
+            bounds = {
+                ...position,
+                width: this.windowWidth,
+                height: this.chatHeight + TITLE_BAR_HEIGHT,
+            };
+            const contentVisible =
+                uiSettings.verticalContentAlwaysVisible || hasBrowserTabs;
+            if (contentVisible) {
+                bounds.height += this.contentHeight + dividerSize;
+            } else {
+                bounds.y += this.contentHeight + dividerSize;
+            }
+            this.contentVisible = contentVisible;
+        } else {
+            bounds = {
+                ...position,
+                width: this.chatWidth,
+                height: this.windowHeight,
+            };
+            const contentVisible =
+                uiSettings.horizontalContentAlwaysVisible || hasBrowserTabs;
+            if (contentVisible) {
+                bounds.width += this.contentWidth + dividerSize;
+            }
 
-            this.setupWebContents(inlineWebContentView.webContents);
+            this.contentVisible = contentVisible;
+        }
 
-            mainWindow.contentView.addChildView(inlineWebContentView);
-            this.inlineWebContentView = inlineWebContentView;
+        // contentVisible may have changed
+        this.ensureAutoEmptyTab();
 
-            mainWindow.setBounds({
-                width: mainWindowSize.width + this.inlineWidth,
-            });
+        return bounds;
+    }
+
+    private updateWindowBounds(position: { x: number; y: number }) {
+        const bounds = this.computeWindowBounds(
+            position,
+            this.hasBrowserTabs(),
+        );
+        debugShellWindow("Set window bound: ", bounds, this.contentVisible);
+        this.mainWindow.setPosition(bounds.x, bounds.y);
+        this.mainWindow.setContentSize(bounds.width, bounds.height);
+
+        if (isLinux) {
+            // Workaround for electron bug where getContentSize isn't updated when "resize" event is fired
+            // https://github.com/electron/electron/issues/42586
+            setTimeout(() => {
+                if (!this.closing) {
+                    this.updateContentSize();
+                }
+            }, 100);
+        } else {
             this.updateContentSize();
         }
-
-        // only open the requested canvas if it isn't already opened
-        if (this.targetUrl !== targetUrl.toString() || newWindow) {
-            inlineWebContentView.webContents
-                .loadURL(targetUrl.toString())
-                .catch((reason) => {
-                    this.openInlineBrowserRetry(
-                        reason,
-                        targetUrl,
-                        inlineWebContentView,
-                    );
-                });
-
-            this.targetUrl = targetUrl.toString();
-            // indicate in the settings which canvas is open
-            this.setUserSettingValue("canvas", targetUrl.toString());
-        }
     }
 
-    /*
-     * Retries to open localhost URLs once the dispatcher has loaded
+    /**
+     * Create a new browser tab and navigate to the specified page
      */
-    public openInlineBrowserRetry(
-        reason: any,
-        targetUrl: URL,
-        inlineWebContentView: WebContentsView,
-    ) {
-        // try again since the host process might not be ready
-        if (!this.dispatcherReady) {
-            setTimeout(() => {
-                this.openInlineBrowserRetry(
-                    { code: "ERR_CONNECTION_REFUSED" },
-                    targetUrl,
-                    inlineWebContentView,
-                );
-            }, 500);
-        } else if (
-            reason.code === "ERR_CONNECTION_REFUSED" &&
-            this.retryCount < 3 &&
-            (targetUrl
-                .toString()
-                .toLowerCase()
-                .startsWith("http://localhost") ||
-                targetUrl
-                    .toString()
-                    .toLowerCase()
-                    .startsWith("https://localhost"))
-        ) {
-            this.retryCount++;
-            setTimeout(() => {
-                inlineWebContentView.webContents
-                    .loadURL(targetUrl.toString())
-                    .catch((reason) => {
-                        this.openInlineBrowserRetry(
-                            reason,
-                            targetUrl,
-                            inlineWebContentView,
-                        );
-                    });
-            }, 500);
+    public async createBrowserTab(
+        url: URL = new URL("about:blank"),
+        options?: { background?: boolean; waitForPageLoad?: boolean },
+    ): Promise<string> {
+        // Handle custom typeagent-browser protocol
+        let resolvedUrl = url;
+        if (url.protocol === "typeagent-browser:") {
+            resolvedUrl = this.resolveCustomProtocolUrl(url);
         }
-    }
 
-    public dispatcherInitialized() {
-        this.dispatcherReady = true;
-    }
-
-    public closeInlineBrowser(save: boolean = true) {
-        const inlineWebContentView = this.inlineWebContentView;
-        if (inlineWebContentView === undefined) {
-            return;
-        }
-        const browserBounds = inlineWebContentView.getBounds();
-        inlineWebContentView.webContents.close();
-        this.mainWindow.contentView.removeChildView(inlineWebContentView);
-        this.inlineWebContentView = undefined;
-
-        const mainWindowSize = this.mainWindow.getBounds();
-        this.mainWindow.setBounds({
-            width: mainWindowSize.width - browserBounds.width,
+        const tabId = await this.browserViewManager.createBrowserTab({
+            url: resolvedUrl.toString(),
+            background: options?.background,
+            waitForPageLoad: options?.waitForPageLoad,
         });
 
-        this.updateContentSize();
-
-        // clear the canvas settings
-        if (save) {
-            this.targetUrl = undefined;
-            this.setUserSettingValue("canvas", undefined);
+        // Re-add overlay views so they are on top
+        for (const views of this.overlayWebContentsViews.keys()) {
+            this.mainWindow.contentView.addChildView(views);
         }
+
+        // setup zoom handlers for the new browser tab
+        this.setupZoomHandlers(
+            this.browserViewManager.getBrowserTab(tabId)?.webContentsView
+                ?.webContents,
+        );
+
+        // Update windows bound when content becomes visible
+        if (!this.contentVisible && this.hasBrowserTabs()) {
+            this.updateWindowBounds(this.getWindowPositionState());
+        }
+
+        // Send update to renderer
+        this.sendTabsUpdate();
+
+        // Restore focus to chat after tab operations
+        if (!options?.background) {
+            // Small delay to let browser view settle
+            setTimeout(() => {
+                if (!this.chatView.webContents.isDestroyed()) {
+                    this.focusChatInput();
+                }
+            }, 50);
+        }
+
+        return tabId;
+    }
+
+    /**
+     * Switch to a specific browser tab
+     */
+    public switchBrowserTab(tabId: string): boolean {
+        const success = this.browserViewManager.setActiveBrowserView(tabId);
+        if (success) {
+            this.updateContentSize();
+        }
+        return success;
+    }
+
+    /**
+     * Close a browser tab
+     */
+    public closeBrowserTab(tabId: string): boolean {
+        const success = this.browserViewManager.closeBrowserTab(tabId);
+        if (success) {
+            this.mainWindow.webContents.send("browser-tab-closed", tabId);
+
+            // Update layout if no tabs left
+            if (!this.hasBrowserTabs()) {
+                this.updateWindowBounds(this.getWindowPositionState());
+            }
+
+            // Restore focus to chat after closing tab
+            this.focusChatInput();
+        }
+        return success;
+    }
+
+    /**
+     * Get the active browser view
+     */
+    public getActiveBrowserView(): BrowserViewContext | null {
+        return this.browserViewManager.getActiveBrowserView();
+    }
+
+    /**
+     * Get all browser tabs
+     */
+    public getAllBrowserTabs(): BrowserViewContext[] {
+        return this.browserViewManager.getAllBrowserTabs();
+    }
+
+    /**
+     * Check if browser tabs are open
+     */
+    public hasBrowserTabs(): boolean {
+        return this.browserViewManager.hasBrowserTabs();
+    }
+
+    /**
+     * Get browser navigation state
+     */
+    public getBrowserNavigationState(): {
+        canGoBack: boolean;
+        canGoForward: boolean;
+    } {
+        // Always use multi-tab browser
+        return this.browserViewManager.getNavigationState();
+    }
+
+    /**
+     * Navigate browser back
+     */
+    public browserGoBack(): boolean {
+        // Always use multi-tab browser
+        return this.browserViewManager.goBack();
+    }
+
+    /**
+     * Navigate browser forward
+     */
+    public browserGoForward(): boolean {
+        // Always use multi-tab browser
+        return this.browserViewManager.goForward();
+    }
+
+    /**
+     * Reload active browser tab
+     */
+    public browserReload(): boolean {
+        // Always use multi-tab browser
+        return this.browserViewManager.reload();
+    }
+
+    /**
+     * Send tab updates to renderer
+     */
+    private sendTabsUpdate(): void {
+        const tabs = this.getAllBrowserTabs().map((tab) => ({
+            id: tab.id,
+            title: tab.title,
+            url: tab.url,
+            favicon: tab.favicon,
+            isActive: tab.isActive,
+        }));
+
+        const activeTab = this.getActiveBrowserView();
+        const tabsData = {
+            tabs,
+            activeTabId: activeTab?.id || null,
+            navigationState: this.getBrowserNavigationState(),
+        };
+
+        this.mainWindow.webContents.send("browser-tabs-updated", tabsData);
+
+        // Also send to all browser tab WebContents for tab validation
+        this.browserViewManager.getAllBrowserTabs().forEach((tab) => {
+            tab.webContentsView.webContents.send(
+                "browser-tabs-updated",
+                tabsData,
+            );
+        });
+    }
+
+    /**
+     * Send navigation state update to renderer
+     */
+    private sendNavigationUpdate(): void {
+        const navigationState = this.getBrowserNavigationState();
+        this.mainWindow.webContents.send(
+            "browser-navigation-updated",
+            navigationState,
+        );
+    }
+
+    // ================================================================
+    // PDF Viewer Support
+    // ================================================================
+    public async checkTypeAgentConnection(): Promise<boolean> {
+        try {
+            const browserIpc = BrowserAgentIpc.getinstance();
+            const webSocket = await browserIpc.ensureWebsocketConnected();
+            return webSocket !== undefined && webSocket.readyState === 1; // WebSocket.OPEN
+        } catch (error) {
+            debugShellWindowError(
+                "Error checking TypeAgent connection:",
+                error,
+            );
+            return false;
+        }
+    }
+
+    public async openPDFViewer(pdfUrl: string): Promise<void> {
+        try {
+            debugShellWindow(`Opening PDF viewer for: ${pdfUrl}`);
+
+            const viewerUrl = await this.constructPDFViewerUrl(pdfUrl);
+            this.createBrowserTab(new URL(viewerUrl), { background: false });
+            return Promise.resolve();
+        } catch (error) {
+            debugShellWindowError("Error opening PDF viewer:", error);
+            throw error;
+        }
+    }
+
+    private async constructPDFViewerUrl(pdfUrl: string): Promise<string> {
+        try {
+            const browserIpc = BrowserAgentIpc.getinstance();
+
+            const response = await new Promise<any>((resolve, reject) => {
+                const timeoutId = setTimeout(() => {
+                    reject(new Error("Timeout getting view host URL"));
+                }, 10000);
+
+                const messageId = Math.random().toString(36).substring(7);
+                const message = {
+                    id: messageId,
+                    method: "getViewHostUrl",
+                    params: {},
+                };
+
+                const originalHandler = browserIpc.onMessageReceived;
+                browserIpc.onMessageReceived = (response: any) => {
+                    if (response.id === messageId) {
+                        clearTimeout(timeoutId);
+                        browserIpc.onMessageReceived = originalHandler;
+                        resolve(response.result);
+                    } else if (originalHandler) {
+                        originalHandler(response);
+                    }
+                };
+
+                browserIpc.send(message).catch(reject);
+            });
+
+            if (!response || !response.url) {
+                throw new Error(
+                    "Unable to get view host URL from TypeAgent service",
+                );
+            }
+
+            const viewerUrl = `${response.url}/pdf/?url=${encodeURIComponent(pdfUrl)}`;
+            debugShellWindow(`Constructed PDF viewer URL: ${viewerUrl}`);
+            return viewerUrl;
+        } catch (error) {
+            debugShellWindowError("Error constructing PDF viewer URL:", error);
+            throw new Error("Failed to get TypeAgent PDF service URL");
+        }
+    }
+
+    private dispatcherReadyPromiseResolvers:
+        | PromiseWithResolvers<void>
+        | undefined = Promise.withResolvers<void>();
+    public dispatcherInitialized() {
+        if (this.dispatcherReadyPromiseResolvers === undefined) {
+            throw new Error("Dispatcher already initialized");
+        }
+        this.dispatcherReadyPromiseResolvers.resolve();
+        this.dispatcherReadyPromiseResolvers = undefined;
+
+        // Notify the renderer process that the dispatcher is initialized
+        this.chatView.webContents.send("dispatcher-initialized");
+
+        // Give focus to the chat view once initialization is done.
+        this.chatView.webContents.focus();
     }
 
     // ================================================================
     // Zoom Handler
     // ================================================================
-    private setupZoomHandlers(webContents: WebContents) {
+    private setupZoomHandlers(
+        webContents: WebContents | undefined,
+        onZoomChanged?: (zoomFactor: number) => void,
+    ) {
+        if (!webContents) return;
+
         webContents.on("before-input-event", (_event, input) => {
             if (
                 (isMac ? input.meta : input.control) &&
@@ -422,11 +1055,11 @@ export class ShellWindow {
                     input.key === "+" ||
                     input.key === "="
                 ) {
-                    this.zoomIn();
+                    this.zoomIn(webContents, onZoomChanged);
                 } else if (input.key === "-" || input.key === "NumpadMinus") {
-                    this.zoomOut();
+                    this.zoomOut(webContents, onZoomChanged);
                 } else if (input.key === "0") {
-                    this.setZoomLevel(1);
+                    this.setZoomFactor(1, webContents, onZoomChanged);
                 }
             }
         });
@@ -434,37 +1067,68 @@ export class ShellWindow {
         // Register mouse wheel as well.
         webContents.on("zoom-changed", (_event, zoomDirection) => {
             if (zoomDirection === "in") {
-                this.zoomIn();
+                this.zoomIn(webContents, onZoomChanged);
             } else {
-                this.zoomOut();
+                this.zoomOut(webContents, onZoomChanged);
             }
         });
     }
 
-    private zoomIn() {
-        this.setZoomLevel(this.chatView.webContents.zoomFactor + 0.1);
+    private zoomIn(
+        webContents: WebContents,
+        onZoomChanged?: (zoomFactor: number) => void,
+    ) {
+        this.setZoomFactor(
+            webContents.zoomFactor + 0.1,
+            webContents,
+            onZoomChanged,
+        );
     }
 
-    private zoomOut() {
-        this.setZoomLevel(this.chatView.webContents.zoomFactor - 0.1);
+    private zoomOut(
+        webContents: WebContents,
+        onZoomChanged?: (zoomFactor: number) => void,
+    ) {
+        this.setZoomFactor(
+            webContents.zoomFactor - 0.1,
+            webContents,
+            onZoomChanged,
+        );
     }
 
-    public setZoomLevel(zoomFactor: number) {
-        if (zoomFactor < 0.1) {
-            zoomFactor = 0.1;
-        } else if (zoomFactor > 10) {
-            zoomFactor = 10;
+    /**
+     * Sets the zoom factor for the active window/tab.
+     * @param zoomFactor - The zoom factor to set for the active window/tab
+     */
+    public setZoomFactor(
+        zoomFactor: number,
+        webContents: WebContents,
+        onZoomChanged?: (zoomFactor: number) => void,
+    ) {
+        // limit zoom factor to reasonable numbers
+        if (zoomFactor < 0.25) {
+            zoomFactor = 0.25;
+        } else if (zoomFactor > 5) {
+            zoomFactor = 5;
         }
 
-        for (const view of this.mainWindow.contentView.children) {
-            if (view instanceof WebContentsView) {
-                view.webContents.zoomFactor = zoomFactor;
-            }
-        }
-
-        this.updateZoomInTitle(zoomFactor);
+        webContents.zoomFactor = zoomFactor;
+        onZoomChanged?.(zoomFactor);
     }
 
+    public updateSummary(title: string, status: [string, string][]) {
+        if (this.closing) {
+            return;
+        }
+        this.mainWindow.setTitle(title);
+        this.chatView.webContents.send("updated-title", title);
+        this.chatView.webContents.send("setting-summary-changed", status);
+    }
+
+    /**
+     * Updates the window title to include the current zoom level.
+     * @param zoomFactor - The zoom factor to show in the title
+     */
     private updateZoomInTitle(zoomFactor: number) {
         const prevTitle = this.mainWindow.getTitle();
         const prevZoomIndex = prevTitle.indexOf(" Zoom: ");
@@ -475,38 +1139,116 @@ export class ShellWindow {
         const zoomTitle =
             zoomFactor === 1 ? "" : ` Zoom: ${Math.round(zoomFactor * 100)}%`;
         this.mainWindow.setTitle(`${summary}${zoomTitle}`);
+
+        // Update the page title to match the window title as well for backwards compat with Playwright tests
+        this.chatView.webContents.send(
+            "updated-title",
+            `${summary}${zoomTitle}`,
+        );
+    }
+
+    // ================================================================
+    // Overlays
+    // ================================================================
+    private updateOverlayBounds() {
+        for (const [view, data] of this.overlayWebContentsViews.entries()) {
+            this.setOverlayBounds(view, data);
+        }
+    }
+    public setOverlayVisibility(visible: boolean) {
+        for (const view of this.overlayWebContentsViews.keys()) {
+            view.setVisible(visible);
+        }
+    }
+
+    public updateOverlay(view: WebContentsView, update?: Partial<OverlayData>) {
+        if (update) {
+            let data = this.overlayWebContentsViews.get(view);
+            if (data === undefined) {
+                this.mainWindow.contentView.addChildView(view);
+                const bounds = view.getBounds();
+                data = {
+                    left: 0,
+                    bottom: 0,
+                    width: bounds.width,
+                    height: bounds.height,
+                };
+
+                this.overlayWebContentsViews.set(view, data);
+            }
+
+            if (update.left) {
+                data.left = update.left;
+            }
+            if (update.bottom) {
+                data.bottom = update.bottom;
+            }
+
+            if (update.width) {
+                data.width = update.width;
+            }
+            if (update.height) {
+                data.height = update.height;
+            }
+
+            this.setOverlayBounds(view, data);
+        } else {
+            this.overlayWebContentsViews.delete(view);
+            this.mainWindow.contentView.removeChildView(view);
+        }
+    }
+
+    private setOverlayBounds(view: WebContentsView, data: OverlayData) {
+        const chatBounds = this.chatView.getBounds();
+        const zoomFactor = this.chatView.webContents.zoomFactor;
+        const left = chatBounds.x + data.left * zoomFactor;
+        const bottom =
+            chatBounds.y + chatBounds.height - data.bottom * zoomFactor;
+        const width = data.width * zoomFactor;
+        const height = data.height * zoomFactor;
+        const newBounds = {
+            x: left,
+            y: bottom - height,
+            width,
+            height,
+        };
+        view.setBounds(newBounds);
+        view.webContents.setZoomFactor(zoomFactor);
     }
 }
 
-function createMainWindow(state: ShellWindowState) {
+function createMainWindow(): BrowserWindow {
+    const isMac = process.platform === "darwin";
+    const isWindows = process.platform === "win32";
+
     const mainWindow = new BrowserWindow({
-        width: state.width,
-        height: state.height,
         show: false,
+        frame: false, // Remove default frame
+        //transparent: true,
+        titleBarStyle: isMac ? "hiddenInset" : "hidden", // Hide title bar
+        titleBarOverlay: isWindows
+            ? {
+                  color: "#e5e5e5", // Matches --title-bar-bg
+                  symbolColor: "#333333", // Matches --text-color
+                  height: 40,
+              }
+            : undefined,
+        trafficLightPosition: isMac ? { x: 12, y: 10 } : undefined,
         autoHideMenuBar: true,
         webPreferences: {
-            preload: path.join(__dirname, "../preload/main.mjs"),
+            preload: path.join(__dirname, "../preload/expose.mjs"),
             sandbox: false,
             zoomFactor: 1,
         },
-        x: state.x,
-        y: state.y,
-    });
-
-    // This (seemingly redundant) call is needed when we use a BrowserView.
-    // Without this call, the mainWindow opens using default width/height, not the
-    // values saved in ShellSettings
-    mainWindow.setBounds({
-        width: state.width,
-        height: state.height,
     });
 
     mainWindow.removeMenu();
 
-    // make sure links are opened in the external browser
-    mainWindow.webContents.setWindowOpenHandler((details) => {
-        shell.openExternal(details.url);
-        return { action: "deny" };
+    // make sure links are opened in the the shell
+    mainWindow.webContents.setWindowOpenHandler(() => {
+        // TODO: add logic for opening in external browser if a modifier key is pressed
+        //shell.openExternal(details.url);
+        return { action: "allow" };
     });
 
     return mainWindow;
@@ -515,18 +1257,12 @@ function createMainWindow(state: ShellWindowState) {
 function createChatView(state: ShellWindowState) {
     const chatView = new WebContentsView({
         webPreferences: {
-            preload: path.join(__dirname, "../preload/index.mjs"),
+            preload: path.join(__dirname, "../preload/chatView.mjs"),
             sandbox: false,
             zoomFactor: state.zoomLevel,
         },
     });
 
-    // ensure links are opened in a new browser window
-    chatView.webContents.setWindowOpenHandler((details) => {
-        // TODO: add logic for keeping things in the browser window
-        shell.openExternal(details.url);
-        return { action: "deny" };
-    });
     return chatView;
 }
 

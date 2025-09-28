@@ -8,7 +8,38 @@ import chalk from "chalk";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
-// --- 🔧 Detect dev mode ---
+// Helper function to create Vite build options that avoid TypeScript plugin conflicts
+function createBuildOptions(outDir, options = {}) {
+    return {
+        configFile: false,
+        logLevel: "error",
+        plugins: [
+            // Explicitly disable TypeScript plugin to avoid outDir conflicts
+            {
+                name: "disable-typescript-plugin",
+                configResolved(config) {
+                    // Remove TypeScript plugin
+                    config.plugins = config.plugins.filter(
+                        (plugin) =>
+                            !plugin.name || !plugin.name.includes("typescript"),
+                    );
+                },
+            },
+        ],
+        esbuild: {
+            // Use esbuild for TypeScript compilation
+            target: "es2022",
+        },
+        build: {
+            outDir,
+            emptyOutDir: options.emptyOutDir ?? false,
+            sourcemap: isDev,
+            minify: !isDev,
+            rollupOptions: options.rollupOptions || {},
+        },
+    };
+}
+
 const isDev =
     process.argv.includes("--dev") ||
     process.argv.includes("--mode=development");
@@ -24,10 +55,17 @@ const sharedScripts = {
     contentScript: "contentScript/index.ts",
     webTypeAgentMain: "webTypeAgentMain.ts",
     webTypeAgentContentScript: "webTypeAgentContentScript.ts",
-    options: "options.ts",
-    sidepanel: "sidepanel.ts",
+    "views/options": "views/options.ts",
+    "views/pageMacros": "views/pageMacros.ts",
+    "views/macrosLibrary": "views/macrosLibrary.ts",
+    "views/entityGraphView": "views/entityGraphView.ts",
+    "views/pageKnowledge": "views/pageKnowledge.ts",
+    "views/annotationsLibrary": "views/annotationsLibrary.ts",
+    "views/knowledgeLibrary": "views/knowledgeLibrary.ts",
+    "views/pdfView": "views/pdfView.ts",
     uiEventsDispatcher: "uiEventsDispatcher.ts",
     "sites/paleobiodb": "sites/paleobiodb.ts",
+    "offscreen/contentProcessor": "offscreen/contentProcessor.ts",
 };
 
 const electronOnlyScripts = {
@@ -53,7 +91,70 @@ const vendorAssets = [
         "node_modules/prismjs/components/prism-json.js",
         "vendor/prism/prism-json.js",
     ],
+    // Cytoscape libraries for entity graph visualization
+    [
+        "node_modules/cytoscape/dist/cytoscape.min.js",
+        "vendor/cytoscape/cytoscape.min.js",
+    ],
+    ["node_modules/dagre/dist/dagre.min.js", "vendor/dagre/dagre.min.js"],
+    [
+        "node_modules/cytoscape-dagre/cytoscape-dagre.js",
+        "vendor/cytoscape-dagre/cytoscape-dagre.min.js",
+    ],
 ];
+
+const libraryAssets = [
+    "views/annotationsLibrary.css",
+    "views/annotationsLibrary.html",
+    "views/entityGraphView.css",
+    "views/entityGraphView.html",
+    "views/knowledgeLibrary.css",
+    "views/knowledgeLibrary.html",
+    "views/macrosLibrary.css",
+    "views/macrosLibrary.html",
+    "views/options.css",
+    "views/options.html",
+    "views/pageKnowledge.css",
+    "views/pageKnowledge.html",
+    "views/pageMacros.css",
+    "views/pageMacros.html",
+    "views/pdfView.css",
+    "views/pdfView.html",
+];
+
+function copyLibraryAssets(outDir) {
+    mkdirSync(`${outDir}/views`, { recursive: true });
+    for (const asset of libraryAssets) {
+        copyFileSync(`${srcDir}/${asset}`, `${outDir}/${asset}`);
+    }
+}
+
+function copyCommonStaticAssets(outDir) {
+    // Copy library assets
+    copyLibraryAssets(outDir);
+
+    // Copy other common assets
+    mkdirSync(`${outDir}/offscreen`, { recursive: true });
+    copyFileSync(
+        `${srcDir}/offscreen/offscreen.html`,
+        `${outDir}/offscreen/offscreen.html`,
+    );
+
+    mkdirSync(`${outDir}/sites`, { recursive: true });
+    copyFileSync(
+        `${srcDir}/sites/paleobiodbSchema.mts`,
+        `${outDir}/sites/paleobiodbSchema.mts`,
+    );
+
+    cpSync(`${srcDir}/images`, `${outDir}/images`, { recursive: true });
+
+    // Copy vendor assets
+    for (const [src, destRel] of vendorAssets) {
+        const dest = resolve(outDir, destRel);
+        mkdirSync(dirname(dest), { recursive: true });
+        copyFileSync(resolve(__dirname, "../", src), dest);
+    }
+}
 
 if (verbose)
     console.log(
@@ -70,13 +171,9 @@ if (verbose)
 if (verbose) console.log(chalk.cyan("🚀 Building Browser extension..."));
 
 // Service worker (ESM)
-await build({
-    logLevel: "error",
-    build: {
-        outDir: chromeOutDir,
+await build(
+    createBuildOptions(chromeOutDir, {
         emptyOutDir: !isDev,
-        sourcemap: isDev,
-        minify: !isDev,
         rollupOptions: {
             input: { serviceWorker: resolve(srcDir, "serviceWorker/index.ts") },
             output: {
@@ -84,21 +181,16 @@ await build({
                 entryFileNames: "serviceWorker.js",
             },
         },
-    },
-});
+    }),
+);
 if (verbose) console.log(chalk.green("✅ Chrome service worker built"));
 
 // Content scripts (IIFE)
 for (const [name, relPath] of Object.entries(sharedScripts)) {
     const input = resolve(srcDir, relPath);
     if (verbose) console.log(chalk.yellow(`➡️  Chrome content: ${name}`));
-    await build({
-        logLevel: "error",
-        build: {
-            outDir: chromeOutDir,
-            emptyOutDir: false,
-            sourcemap: isDev,
-            minify: !isDev,
+    await build(
+        createBuildOptions(chromeOutDir, {
             rollupOptions: {
                 input,
                 output: {
@@ -107,27 +199,15 @@ for (const [name, relPath] of Object.entries(sharedScripts)) {
                     inlineDynamicImports: true,
                 },
             },
-        },
-    });
+        }),
+    );
     if (verbose) console.log(chalk.green(`✅ Chrome ${name}.js built`));
 }
 
 // Static file copy
 if (verbose) console.log(chalk.cyan("\n📁 Copying Chrome static files..."));
 copyFileSync(`${srcDir}/manifest.json`, `${chromeOutDir}/manifest.json`);
-copyFileSync(`${srcDir}/sidepanel.html`, `${chromeOutDir}/sidepanel.html`);
-copyFileSync(`${srcDir}/options.html`, `${chromeOutDir}/options.html`);
-mkdirSync(`${chromeOutDir}/sites`, { recursive: true });
-copyFileSync(
-    `${srcDir}/sites/paleobiodbSchema.mts`,
-    `${chromeOutDir}/sites/paleobiodbSchema.mts`,
-);
-cpSync(`${srcDir}/images`, `${chromeOutDir}/images`, { recursive: true });
-for (const [src, destRel] of vendorAssets) {
-    const dest = resolve(chromeOutDir, destRel);
-    mkdirSync(dirname(dest), { recursive: true });
-    copyFileSync(resolve(__dirname, "../", src), dest);
-}
+copyCommonStaticAssets(chromeOutDir);
 if (verbose) console.log(chalk.green("✅ Chrome static assets copied"));
 
 //
@@ -140,13 +220,8 @@ if (verbose) console.log(chalk.cyan("\n🚀 Building Electron extension..."));
 for (const [name, relPath] of Object.entries(sharedScripts)) {
     const input = resolve(srcDir, relPath);
     if (verbose) console.log(chalk.yellow(`➡️  Electron shared: ${name}`));
-    await build({
-        logLevel: "error",
-        build: {
-            outDir: electronOutDir,
-            emptyOutDir: false,
-            sourcemap: isDev,
-            minify: !isDev,
+    await build(
+        createBuildOptions(electronOutDir, {
             rollupOptions: {
                 input,
                 output: {
@@ -155,21 +230,16 @@ for (const [name, relPath] of Object.entries(sharedScripts)) {
                     inlineDynamicImports: true,
                 },
             },
-        },
-    });
+        }),
+    );
     if (verbose) console.log(chalk.green(`✅ Electron ${name}.js built`));
 }
 
 for (const [name, relPath] of Object.entries(electronOnlyScripts)) {
     const input = resolve(__dirname, relPath);
     if (verbose) console.log(chalk.yellow(`➡️  Electron only: ${name}`));
-    await build({
-        logLevel: "error",
-        build: {
-            outDir: electronOutDir,
-            emptyOutDir: false,
-            sourcemap: isDev,
-            minify: !isDev,
+    await build(
+        createBuildOptions(electronOutDir, {
             rollupOptions: {
                 input,
                 output: {
@@ -178,18 +248,22 @@ for (const [name, relPath] of Object.entries(electronOnlyScripts)) {
                     inlineDynamicImports: true,
                 },
             },
-        },
-    });
+        }),
+    );
     if (verbose) console.log(chalk.green(`✅ Electron ${name}.js built`));
 }
 
-// Copy electron manifest
+// Copy electron manifest and assets
 if (verbose) console.log(chalk.cyan("\n📁 Copying Electron static files..."));
 copyFileSync(
     `${electronSrcDir}/manifest.json`,
     `${electronOutDir}/manifest.json`,
 );
+copyCommonStaticAssets(electronOutDir);
 if (verbose) console.log(chalk.green("✅ Electron static assets copied\n"));
+
+// Update build hash to mark successful completion
+// updateBuildHash(true); // true = actually built something
 
 if (verbose)
     console.log(

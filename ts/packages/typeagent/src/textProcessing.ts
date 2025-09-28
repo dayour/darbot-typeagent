@@ -16,7 +16,6 @@ import {
     getData,
     success,
 } from "typechat";
-import * as cheerio from "cheerio";
 import { getHtml, bing, ChatModel, TextEmbeddingModel } from "aiclient";
 import { createChatTranslator } from "./chat.js";
 import { MessageSourceRole } from "./message.js";
@@ -26,6 +25,7 @@ import fs from "fs";
 import { textToProcessSection } from "./promptLib.js";
 import { ProcessProgress, mapAsync } from "./arrayAsync.js";
 import { generateTextEmbeddings, similarity, SimilarityType } from "./index.js";
+import * as cheerio from "cheerio";
 
 function splitIntoSentences(text: string): string[] {
     return text.split(/(?<=[.!?;\r\n])\s+/);
@@ -342,6 +342,13 @@ export interface ChunkChatResponse {
     entities: Entity[];
     // the urls of the web pages that were used to generate the response
     urls?: string[];
+}
+
+export interface SummarizeResponse {
+    // the summary of the text
+    summary: string;
+    // all entities present in the original text and the summary
+    entities: Entity[];
 }
 
 export function accumulateAnswer(
@@ -1143,6 +1150,23 @@ export async function generateNotesForWebPage(
 
 const summarizeInstruction = "Summarize the given text";
 
+const summarizeWithKnowledgeInstruction = `
+    You are a service that summarizes text into a JSON object of type "SummarizeResponse" according to the following TypeScript definition:
+    export interface Entity {
+        // the name of the entity such as "Bach" or "frog"
+        name: string;
+        // the types of the entity such as "artist" or "animal"; an entity can have multiple types; entity types should be single words
+        type: string[];
+    }
+    interface SummarizeResponse {
+        // the summary of the text
+        summary: string;
+        // all entities present in the original text and the summary
+        entities: Entity[];
+    }
+    Below is the text to summarize and extract entities from:
+`;
+
 /**
  * Summarize the given text
  * @param model model to use to generate notes
@@ -1151,19 +1175,36 @@ const summarizeInstruction = "Summarize the given text";
  * @param progress
  * @returns
  */
-export function summarize(
+export async function summarize(
     model: TypeChatLanguageModel,
     text: string,
     maxCharsPerChunk: number,
     progress?: Progress<string>,
-): Promise<Result<string[]>> {
-    return getCompletionOnLargeText(
-        text,
-        maxCharsPerChunk - notesInstruction.length,
-        model,
-        summarizeInstruction,
-        progress,
-    );
+    knowledgeExtraction?: boolean | undefined,
+): Promise<Result<string[] | SummarizeResponse>> {
+    if (knowledgeExtraction) {
+        const response = await getCompletionOnLargeText(
+            text,
+            maxCharsPerChunk - notesInstruction.length,
+            model,
+            summarizeWithKnowledgeInstruction,
+            progress,
+        );
+
+        if (response.success) {
+            return success(JSON.parse((response.data as string[]).join("\n")));
+        } else {
+            throw new Error(response.message);
+        }
+    } else {
+        return getCompletionOnLargeText(
+            text,
+            maxCharsPerChunk - notesInstruction.length,
+            model,
+            summarizeInstruction,
+            progress,
+        );
+    }
 }
 
 /**

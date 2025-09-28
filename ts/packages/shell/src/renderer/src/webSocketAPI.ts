@@ -51,6 +51,25 @@ export const webapi: ClientAPI = {
     openFolder: () => {
         // not supported on mobile
     },
+    openUrlInBrowserTab: () => {
+        // not supported on mobile
+    },
+    searchMenuUpdate: () => {
+        // not supported on mobile
+        throw new Error("Not implemented");
+    },
+    searchMenuAdjustSelection: () => {
+        // not supported on mobile
+        throw new Error("Not implemented");
+    },
+    searchMenuSelectCompletion: () => {
+        // not supported on mobile
+        throw new Error("Not implemented");
+    },
+    searchMenuClose: () => {
+        // not supported on mobile
+        throw new Error("Not implemented");
+    },
 };
 
 const dispatcherChannel = createGenericChannel((message: any) =>
@@ -98,10 +117,7 @@ export async function createWebSocket(autoReconnect: boolean = true) {
                     break;
 
                 case "setting-summary-changed":
-                    const agentsMap = new Map<string, string>(
-                        msgObj.data.registeredAgents,
-                    );
-                    client?.updateRegisterAgents(agentsMap);
+                    client?.updateRegisterAgents(msgObj.data.registeredAgents);
                     break;
                 /* TODO: Not implemented yet.
                 case "listen-event":

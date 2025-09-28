@@ -20,6 +20,7 @@ import {
     StorageListOptions,
     TemplateSchema,
     TypeAgentAction,
+    CompletionGroup,
 } from "@typeagent/agent-sdk";
 import { ResolveEntityResult } from "../../agentSdk/dist/agentInterface.js";
 import { AgentInterfaceFunctionName } from "./server.js";
@@ -119,6 +120,12 @@ export type AgentContextInvokeFunctions = {
         choices?: string[] | undefined;
         defaultId?: number | undefined;
     }) => Promise<number>;
+
+    queueToggleTransientAgent: (
+        contextId: number,
+        agentName: string,
+        active: boolean,
+    ) => Promise<void>;
 };
 
 export type AgentCallFunctions = {
@@ -133,9 +140,15 @@ export type AgentCallFunctions = {
 };
 
 export type AgentInvokeFunctions = {
-    initializeAgentContext: (
-        settings?: AppAgentInitSettings,
-    ) => Promise<unknown>;
+    initializeAgentContext: (param: {
+        settings: AppAgentInitSettings | undefined;
+        optionsCallBack:
+            | {
+                  id: number;
+                  functions: string[];
+              }
+            | undefined;
+    }) => Promise<unknown>;
     updateAgentContext: (
         param: Partial<ContextParams> & {
             enable: boolean;
@@ -164,7 +177,7 @@ export type AgentInvokeFunctions = {
             params: ParsedCommandParams<ParameterDefinitions>;
             names: string[];
         },
-    ): Promise<string[]>;
+    ): Promise<CompletionGroup[]>;
     executeCommand(
         param: Partial<ActionContextParams> & {
             commands: string[];
@@ -189,13 +202,14 @@ export type AgentInvokeFunctions = {
             data: unknown;
             propertyName: string;
         },
-    ): Promise<string[]>;
+    ): Promise<string[] | undefined>;
     getActionCompletion(
         param: Partial<ContextParams> & {
             partialAction: AppAction;
             propertyName: string;
+            entityTypeName: string | undefined;
         },
-    ): Promise<string[]>;
+    ): Promise<string[] | undefined>;
 };
 
 export type ContextParams = {
@@ -208,4 +222,12 @@ export type ContextParams = {
 export type ActionContextParams = ContextParams & {
     actionContextId: number;
     activityContext: ActivityContext | undefined;
+};
+
+export type OptionsFunctionCallBack = {
+    callback(param: {
+        name: string;
+        id: number;
+        args: unknown[];
+    }): Promise<unknown>;
 };

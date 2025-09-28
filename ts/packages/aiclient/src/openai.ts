@@ -61,11 +61,12 @@ export type CommonApiSettings = {
     provider: ModelProviders;
     modelType: ModelType;
     endpoint: string;
-    maxRetryAttempts?: number;
-    retryPauseMs?: number;
     maxConcurrency?: number | undefined;
     throttler?: FetchThrottler;
     enableModelRequestLogging?: boolean | undefined;
+    timeout?: number | undefined;
+    maxRetryAttempts?: number | undefined;
+    retryPauseMs?: number | undefined;
 };
 /**
  * Settings used by OpenAI clients
@@ -87,12 +88,16 @@ export enum EnvVars {
     OPENAI_MODEL = "OPENAI_MODEL",
     OPENAI_RESPONSE_FORMAT = "OPENAI_RESPONSE_FORMAT",
     OPENAI_MAX_CONCURRENCY = "AZURE_OPENAI_MAX_CONCURRENCY",
+    OPENAI_MAX_TIMEOUT = "OPENAI_MAX_TIMEOUT",
+    OPENAI_MAX_RETRYATTEMPTS = "OPENAI_MAX_RETRYATTEMPTS",
     OPENAI_MODEL_EMBEDDING = "OPENAI_MODEL_EMBEDDING",
 
     AZURE_OPENAI_API_KEY = "AZURE_OPENAI_API_KEY",
     AZURE_OPENAI_ENDPOINT = "AZURE_OPENAI_ENDPOINT",
     AZURE_OPENAI_RESPONSE_FORMAT = "AZURE_OPENAI_RESPONSE_FORMAT",
     AZURE_OPENAI_MAX_CONCURRENCY = "AZURE_OPENAI_MAX_CONCURRENCY",
+    AZURE_OPENAI_MAX_TIMEOUT = "AZURE_OPENAI_MAX_TIMEOUT",
+    AZURE_OPENAI_MAX_RETRYATTEMPTS = "AZURE_OPENAI_MAX_RETRYATTEMPTS",
     AZURE_OPENAI_MAX_CHARS = "AZURE_OPENAI_MAX_CHARS",
 
     AZURE_OPENAI_API_KEY_EMBEDDING = "AZURE_OPENAI_API_KEY_EMBEDDING",
@@ -587,6 +592,7 @@ function createAzureOpenAIChatModel(
             params,
             settings.maxRetryAttempts,
             settings.retryPauseMs,
+            settings.timeout,
         );
         if (!result.success) {
             return result;
@@ -734,16 +740,19 @@ export function createChatModelDefault(tag: string): ChatModelWithStreaming {
  * Uses the type: json_object flag
  * @param endpoint
  * @param tags - Tags for tracking this model's usage
+ * @param completionSettings Completion settings for the model
  * @returns ChatModel
  */
 export function createJsonChatModel(
     endpoint?: string | ApiSettings,
     tags?: string[],
+    completionSettings?: CompletionSettings,
 ): ChatModelWithStreaming {
     return createChatModel(
         endpoint,
         {
             response_format: { type: "json_object" },
+            ...completionSettings,
         },
         undefined,
         tags,
@@ -778,7 +787,16 @@ export type AzureChatModelName =
     | "GPT_4"
     | "GPT_35_TURBO"
     | "GPT_4_O"
-    | "GPT_4_O_MINI";
+    | "GPT_4_O_MINI"
+    | "GPT_5"
+    | "GPT_5_MINI"
+    | "GPT_5_NANO"
+    | "GPT_5_CHAT";
+
+export const GPT_5: AzureChatModelName = "GPT_5";
+export const GPT_5_NANO: AzureChatModelName = "GPT_5_NANO";
+export const GPT_5_MINI: AzureChatModelName = "GPT_5_MINI";
+export const GPT_5_CHAT: AzureChatModelName = "GPT_5_CHAT";
 
 /**
  * Create a client for the OpenAI embeddings service

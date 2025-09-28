@@ -6,54 +6,68 @@ import {
     app,
     globalShortcut,
     dialog,
-    session,
-    WebContentsView,
     shell,
-    Notification,
+    protocol,
 } from "electron";
 import path from "node:path";
 import fs from "node:fs";
-import { ClientIO, createDispatcher, Dispatcher } from "agent-dispatcher";
-import {
-    getDefaultAppAgentProviders,
-    getDefaultAppAgentInstaller,
-    getDefaultConstructionProvider,
-} from "default-agent-provider";
 import {
     ensureShellDataDir,
     getShellDataDir,
-    loadShellSettings,
-    ShellSettings,
+    ShellSettingManager,
     ShellUserSettings,
 } from "./shellSettings.js";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
-import { createShellAgentProvider } from "./agent.js";
-import { BrowserAgentIpc } from "./browserIpc.js";
-import { WebSocketMessageV2 } from "common-utils";
-import { AzureSpeech } from "./azureSpeech.js";
+import { closeLocalWhisper } from "./localWhisperCommandHandler.js";
+import { getInstanceDir } from "agent-dispatcher/helpers/data";
 import {
-    closeLocalWhisper,
-    isLocalWhisperEnabled,
-} from "./localWhisperCommandHandler.js";
-import { createDispatcherRpcServer } from "agent-dispatcher/rpc/dispatcher/server";
-import { createGenericChannel } from "agent-rpc/channel";
-import net from "node:net";
-import { createClientIORpcClient } from "agent-dispatcher/rpc/clientio/client";
-import { getClientId, getInstanceDir } from "agent-dispatcher/helpers/data";
-import { ShellWindow } from "./shellWindow.js";
+    initializeInstance,
+    closeInstance,
+    getShellWindow,
+    getShellWindowForChatViewIpcEvent,
+    getShellWindowForMainWindowIpcEvent,
+    fatal,
+} from "./instance.js";
 
-import { debugShell, debugShellError } from "./debug.js";
+import {
+    debugShell,
+    debugShellCleanup,
+    debugShellError,
+    debugShellInit,
+} from "./debug.js";
 import { loadKeys, loadKeysFromEnvFile } from "./keys.js";
 import { parseShellCommandLine } from "./args.js";
 import {
-    hasPendingUpdate,
-    setPendingUpdateCallback,
     setUpdateConfigPath,
     startBackgroundUpdateCheck,
 } from "./commands/update.js";
+import { initializeSearchMenuUI } from "./electronSearchMenuUI.js";
+import { initializePen } from "./commands/pen.js";
+import { initializeSpeech, triggerRecognitionOnce } from "./speech.js";
+
+import {
+    initializePDFViewerIpcHandlers,
+    initializeExternalStorageIpcHandlers,
+    initializeBrowserExtension,
+} from "./webViewIpcHandlers.js";
 
 debugShell("App name", app.getName());
 debugShell("App version", app.getVersion());
+
+// Register custom protocol scheme as privileged
+protocol.registerSchemesAsPrivileged([
+    {
+        scheme: "typeagent-browser",
+        privileges: {
+            standard: true,
+            secure: true,
+            bypassCSP: true,
+            allowServiceWorkers: true,
+            supportFetchAPI: true,
+            corsEnabled: true,
+        },
+    },
+]);
 
 if (process.platform === "darwin") {
     if (fs.existsSync("/opt/homebrew/bin/az")) {
@@ -67,6 +81,8 @@ process.env.FORCE_COLOR = "true";
 const parsedArgs = parseShellCommandLine();
 export const isProd = parsedArgs.prod ?? app.isPackaged;
 debugShell("Is prod", isProd);
+export const isTest = parsedArgs.test ?? false;
+debugShell("Is test", isTest);
 
 // Use single instance lock in prod to make the existing instance focus
 // Allow multiple instance for dev build, with lock for data directory "instanceDir".
@@ -91,7 +107,6 @@ const instanceDir =
         : getInstanceDir());
 
 debugShell("Instance Dir", instanceDir);
-
 if (parsedArgs.clean) {
     // Delete all files in the instance dir.
     if (fs.existsSync(instanceDir)) {
@@ -119,342 +134,19 @@ if (parsedArgs.update) {
 }
 
 const time = performance.now();
-debugShell("Starting...");
-
-function createWindow(shellSettings: ShellSettings) {
-    debugShell("Creating window", performance.now() - time);
-
-    // Create the browser window.
-    const shellWindow = new ShellWindow(shellSettings, instanceDir);
-
-    initializeSpeech(shellWindow.chatView);
-
-    ipcMain.on("views-resized-by-user", (_, newX: number) => {
-        shellWindow.updateContentSize(newX);
-    });
-
-    ipcMain.handle("init-browser-ipc", async () => {
-        await BrowserAgentIpc.getinstance().ensureWebsocketConnected();
-
-        BrowserAgentIpc.getinstance().onMessageReceived = (
-            message: WebSocketMessageV2,
-        ) => {
-            shellWindow.sendMessageToInlineWebContent(message);
-        };
-    });
-
-    return shellWindow;
-}
-
-let speechToken:
-    | { token: string; expire: number; region: string; endpoint: string }
-    | undefined;
-
-async function getSpeechToken(silent: boolean) {
-    const instance = AzureSpeech.getInstance();
-    if (instance === undefined) {
-        if (!silent) {
-            dialog.showErrorBox(
-                "Azure Speech Service: Missing configuration",
-                "Environment variable SPEECH_SDK_KEY or SPEECH_SDK_REGION is missing.  Switch to local whisper or provide the configuration and restart.",
-            );
-        }
-        return undefined;
-    }
-
-    if (speechToken !== undefined && speechToken.expire > Date.now()) {
-        return speechToken;
-    }
-    try {
-        debugShell("Getting speech token");
-        const tokenResponse = await instance.getTokenAsync();
-        speechToken = {
-            token: tokenResponse.token,
-            expire: Date.now() + 9 * 60 * 1000, // 9 minutes (token expires in 10 minutes)
-            region: tokenResponse.region,
-            endpoint: tokenResponse.endpoint,
-        };
-        return speechToken;
-    } catch (e: any) {
-        debugShellError("Error getting speech token", e);
-        if (!silent) {
-            dialog.showErrorBox(
-                "Azure Speech Service: Error getting token",
-                e.message,
-            );
-        }
-        return undefined;
-    }
-}
-
-async function triggerRecognitionOnce(chatView: WebContentsView) {
-    const speechToken = await getSpeechToken(false);
-    const useLocalWhisper = isLocalWhisperEnabled();
-    chatView.webContents.send("listen-event", speechToken, useLocalWhisper);
-}
-
-function initializeSpeech(chatView: WebContentsView) {
-    const key = process.env["SPEECH_SDK_KEY"] ?? "identity";
-    const region = process.env["SPEECH_SDK_REGION"];
-    const endpoint = process.env["SPEECH_SDK_ENDPOINT"] as string;
-    if (region) {
-        AzureSpeech.initialize({
-            azureSpeechSubscriptionKey: key,
-            azureSpeechRegion: region,
-            azureSpeechEndpoint: endpoint,
-        });
-    } else {
-        debugShellError("Speech: no key or region");
-    }
-
-    ipcMain.handle("get-speech-token", async (_, silent: boolean) => {
-        return getSpeechToken(silent);
-    });
-    const ret = globalShortcut.register("Alt+M", () => {
-        triggerRecognitionOnce(chatView);
-    });
-
-    if (ret) {
-        // Double check whether a shortcut is registered.
-        debugShell(
-            `Global shortcut Alt+M: ${globalShortcut.isRegistered("Alt+M")}`,
-        );
-    } else {
-        debugShellError("Global shortcut registration failed");
-    }
-}
-
-async function initializeDispatcher(
-    instanceDir: string,
-    shellWindow: ShellWindow,
-    updateSummary: (dispatcher: Dispatcher) => void,
-) {
-    try {
-        const clientIOChannel = createGenericChannel((message: any) => {
-            shellWindow.chatView.webContents.send("clientio-rpc-call", message);
-        });
-        ipcMain.on("clientio-rpc-reply", (_event, message) => {
-            clientIOChannel.message(message);
-        });
-
-        const newClientIO = createClientIORpcClient(clientIOChannel.channel);
-        const clientIO: ClientIO = {
-            ...newClientIO,
-            // Main process intercepted clientIO calls
-            popupQuestion: async (
-                message: string,
-                choices: string[],
-                defaultId: number | undefined,
-                source: string,
-            ) => {
-                const result = await dialog.showMessageBox(
-                    shellWindow.mainWindow,
-                    {
-                        type: "question",
-                        buttons: choices,
-                        defaultId,
-                        message,
-                        icon: source,
-                    },
-                );
-                return result.response;
-            },
-            openLocalView: (port: number) => {
-                debugShell(`Opening local view on port ${port}`);
-                return shellWindow.openInlineBrowser(
-                    new URL(`http://localhost:${port}/`),
-                );
-            },
-            closeLocalView: (port: number) => {
-                const current = shellWindow.inlineBrowserUrl;
-                debugShell(
-                    `Closing local view on port ${port}, current url: ${current}`,
-                );
-                if (current === `http://localhost:${port}/`) {
-                    shellWindow.closeInlineBrowser();
-                }
-            },
-            exit: () => {
-                app.quit();
-            },
-        };
-
-        // Set up dispatcher
-        const newDispatcher = await createDispatcher("shell", {
-            appAgentProviders: [
-                createShellAgentProvider(shellWindow),
-                ...getDefaultAppAgentProviders(instanceDir),
-            ],
-            agentInstaller: getDefaultAppAgentInstaller(instanceDir),
-            persistSession: true,
-            persistDir: instanceDir,
-            enableServiceHost: true,
-            metrics: true,
-            dblogging: true,
-            clientId: getClientId(),
-            clientIO,
-            constructionProvider: getDefaultConstructionProvider(),
-            allowSharedLocalView: ["shell"],
-            portBase: isProd ? 9001 : 9050,
-        });
-
-        async function processShellRequest(
-            text: string,
-            id: string,
-            images: string[],
-        ) {
-            if (typeof text !== "string" || typeof id !== "string") {
-                throw new Error("Invalid request");
-            }
-            debugShell(newDispatcher.getPrompt(), text);
-            // Update before processing the command in case there was change outside of command processing
-            updateSummary(dispatcher);
-            const commandResult = await newDispatcher.processCommand(
-                text,
-                id,
-                images,
-            );
-            shellWindow.chatView.webContents.send(
-                "send-demo-event",
-                "CommandProcessed",
-            );
-
-            // Update the summary after processing the command in case state changed.
-            updateSummary(dispatcher);
-            return commandResult;
-        }
-
-        const dispatcher = {
-            ...newDispatcher,
-            processCommand: processShellRequest,
-        };
-
-        // Set up the RPC
-        const dispatcherChannel = createGenericChannel((message: any) => {
-            shellWindow.chatView.webContents.send(
-                "dispatcher-rpc-reply",
-                message,
-            );
-        });
-        ipcMain.on("dispatcher-rpc-call", (_event, message) => {
-            dispatcherChannel.message(message);
-        });
-        createDispatcherRpcServer(dispatcher, dispatcherChannel.channel);
-
-        setupQuit(dispatcher);
-
-        shellWindow.dispatcherInitialized();
-
-        // Dispatcher is ready to be called from the client, but we need to wait for the dom to be ready to start
-        // using it to process command, so that the client can receive messages.
-        debugShell("Dispatcher initialized", performance.now() - time);
-
-        return dispatcher;
-    } catch (e: any) {
-        dialog.showErrorBox("Exception initializing dispatcher", e.stack);
-        return undefined;
-    }
-}
-
-async function initializeInstance(
-    instanceDir: string,
-    shellSettings: ShellSettings,
-) {
-    const shellWindow = createWindow(shellSettings);
-    const { mainWindow, chatView } = shellWindow;
-    let title: string = "";
-    function updateTitle(dispatcher: Dispatcher) {
-        const newSettingSummary = dispatcher.getSettingSummary();
-        const zoomFactor = chatView.webContents.zoomFactor;
-        const pendingUpdate = hasPendingUpdate() ? " [Pending Update]" : "";
-        const zoomFactorTitle =
-            zoomFactor === 1 ? "" : ` Zoom: ${Math.round(zoomFactor * 100)}%`;
-        const newTitle = `${app.getName()} v${app.getVersion()} - ${newSettingSummary}${pendingUpdate}${zoomFactorTitle}`;
-        if (newTitle !== title) {
-            title = newTitle;
-            chatView.webContents.send(
-                "setting-summary-changed",
-                dispatcher.getTranslatorNameToEmojiMap(),
-            );
-
-            mainWindow.setTitle(newTitle);
-        }
-    }
-
-    // Note: Make sure dom ready before using dispatcher.
-    const dispatcherP = initializeDispatcher(
-        instanceDir,
-        shellWindow,
-        updateTitle,
-    );
-
-    ipcMain.on("dom ready", async () => {
-        debugShell("Showing window", performance.now() - time);
-
-        // The dispatcher can be use now that dom is ready and the client is ready to receive messages
-        const dispatcher = await dispatcherP;
-        if (dispatcher === undefined) {
-            app.quit();
-            return;
-        }
-        updateTitle(dispatcher);
-        setPendingUpdateCallback((version, background) => {
-            updateTitle(dispatcher);
-            if (background) {
-                new Notification({
-                    title: `New version ${version.version} available`,
-                    body: `Restart to install the update.`,
-                }).show();
-            }
-        });
-
-        // send the agent greeting if it's turned on
-        if (shellSettings.user.agentGreeting) {
-            dispatcher.processCommand("@greeting", "agent-0", []);
-        }
-    });
-
-    ipcMain.on("save-settings", (_event, settings: ShellUserSettings) => {
-        shellWindow.setUserSettings(settings);
-    });
-
-    ipcMain.on("open-image-file", async () => {
-        const result = await dialog.showOpenDialog(mainWindow, {
-            filters: [
-                {
-                    name: "Image files",
-                    extensions: ["png", "jpg", "jpeg", "gif"],
-                },
-            ],
-        });
-
-        if (result && !result.canceled) {
-            let paths = result.filePaths;
-            if (paths && paths.length > 0) {
-                const content = readFileSync(paths[0], "base64");
-                chatView.webContents.send("file-selected", paths[0], content);
-            }
-        }
-    });
-
-    ipcMain.on("open-folder", async (_event, path: string) => {
-        shell.openPath(path);
-    });
-
-    return shellWindow.waitForContentLoaded();
-}
+debugShellInit("Starting...");
 
 // This method will be called when Electron has finished
 // initialization and is ready to create browser windows.
 // Some APIs can only be used after this event occurs.
 async function initialize() {
-    debugShell("Ready", performance.now() - time);
+    debugShellInit("Ready", performance.now() - time);
 
     const appPath = app.getAppPath();
     const envFile = parsedArgs.env
         ? path.resolve(appPath, parsedArgs.env)
         : undefined;
-    if (parsedArgs.test) {
+    if (isTest) {
         if (!envFile) {
             throw new Error("Test mode requires --env argument");
         }
@@ -466,23 +158,43 @@ async function initialize() {
             envFile,
         );
     }
-    const browserExtensionPath = path.join(
-        // HACK HACK for packaged build: The browser extension cannot be loaded from ASAR, so it is not packed.
-        // Assume we can just replace app.asar with app.asar.unpacked in all cases.
-        path.basename(appPath) === "app.asar"
-            ? path.join(path.dirname(appPath), "app.asar.unpacked")
-            : appPath,
-        "node_modules/browser-typeagent/dist/electron",
-    );
-    await session.defaultSession.loadExtension(browserExtensionPath, {
-        allowFileAccess: true,
+
+    protocol.handle("typeagent-browser", (request) => {
+        const url = new URL(request.url);
+        const pathname = url.pathname;
+        const queryString = url.search;
+
+        const browserExtensionUrls = (global as any).browserExtensionUrls;
+        if (browserExtensionUrls && browserExtensionUrls[pathname]) {
+            const resolvedUrl = browserExtensionUrls[pathname] + queryString;
+            debugShell(`Protocol handler: ${request.url} -> ${resolvedUrl}`);
+
+            const shellWindow = getShellWindow();
+            if (shellWindow) {
+                shellWindow.createBrowserTab(new URL(resolvedUrl), {
+                    background: false,
+                });
+            }
+
+            // Return a redirect response
+            return new Response("", {
+                status: 302,
+                headers: { Location: resolvedUrl },
+            });
+        } else {
+            debugShell(`Protocol handler: Unknown library page: ${pathname}`);
+            return new Response("Not Found", { status: 404 });
+        }
     });
 
-    const shellSettings = loadShellSettings(instanceDir);
+    const shellSettings = new ShellSettingManager(instanceDir);
     const settings = shellSettings.user;
     const dataDir = getShellDataDir(instanceDir);
     const chatHistory: string = path.join(dataDir, "chat_history.html");
-    ipcMain.handle("get-chat-history", async () => {
+    ipcMain.handle("get-chat-history", async (event) => {
+        // Make sure the event is from the chat view of the current shell window
+        const shellWindow = getShellWindowForChatViewIpcEvent(event);
+        if (!shellWindow) return;
         if (settings.chatHistory) {
             // Load chat history if enabled
             if (existsSync(chatHistory)) {
@@ -494,7 +206,11 @@ async function initialize() {
 
     // Store the chat history whenever the DOM changes
     // this let's us rehydrate the chat when reopening the shell
-    ipcMain.on("save-chat-history", async (_, html) => {
+    ipcMain.on("save-chat-history", async (event, html) => {
+        // Make sure the event is from the chat view of the current shell window
+        const shellWindow = getShellWindowForChatViewIpcEvent(event);
+        if (!shellWindow) return;
+
         // store the modified DOM contents
 
         debugShell(
@@ -510,78 +226,157 @@ async function initialize() {
                 performance.now(),
             );
         }
+
+        // sync the chat history with any chat history tab
+        shellWindow?.chatViewServer?.broadcast(html);
     });
 
-    ipcMain.handle("get-localWhisper-status", async () => {
-        return isLocalWhisperEnabled();
+    ipcMain.on("save-settings", (event, settings: ShellUserSettings) => {
+        const shellWindow = getShellWindowForChatViewIpcEvent(event);
+        shellWindow?.setUserSettings(settings);
     });
 
-    ipcMain.on("send-to-browser-ipc", async (_, data: WebSocketMessageV2) => {
-        await BrowserAgentIpc.getinstance().send(data);
+    ipcMain.on("views-resized-by-user", (event, newPos: number) => {
+        const shellWindow = getShellWindowForMainWindowIpcEvent(event);
+        shellWindow?.updateContentSize(newPos);
     });
 
-    app.on("activate", async function () {
-        // On macOS it's common to re-create a window in the app when the
-        // dock icon is clicked and there are no other windows open.
-        if (ShellWindow.getInstance() === undefined)
-            await initializeInstance(instanceDir, shellSettings);
+    ipcMain.handle("toggle-layout", (event) => {
+        const shellWindow = getShellWindowForMainWindowIpcEvent(event);
+        if (shellWindow) {
+            // Toggle the verticalLayout setting
+            const currentLayout =
+                shellWindow.getUserSettings().ui.verticalLayout;
+            const newLayout = !currentLayout;
+            shellWindow.setUserSettingValue("ui.verticalLayout", newLayout);
+
+            // Return the new layout state
+            return { verticalLayout: newLayout };
+        }
+        return null;
     });
 
-    // On windows, we will spin up a local end point that listens
-    // for pen events which will trigger speech reco
-    // Don't spin this up during testing
-    if (process.platform == "win32" && !parsedArgs.test) {
-        const pipePath = path.join("\\\\.\\pipe\\TypeAgent", "speech");
-        const server = net.createServer((stream) => {
-            stream.on("data", (c) => {
-                const shellWindow = ShellWindow.getInstance();
-                if (shellWindow === undefined) {
-                    // Ignore if there is no shell window
-                    return;
-                }
-                if (c.toString() == "triggerRecognitionOnce") {
-                    console.log("Pen click note button click received!");
-                    triggerRecognitionOnce(shellWindow.chatView);
-                }
-            });
-            stream.on("error", (e) => {
-                console.log(e);
-            });
+    // Window control handlers
+    ipcMain.on("window-minimize", (event) => {
+        const shellWindow = getShellWindowForMainWindowIpcEvent(event);
+        shellWindow?.minimize();
+    });
+
+    ipcMain.on("window-maximize", (event) => {
+        const shellWindow = getShellWindowForMainWindowIpcEvent(event);
+        shellWindow?.toggleMaximize();
+    });
+
+    ipcMain.on("window-close", (event) => {
+        const shellWindow = getShellWindowForMainWindowIpcEvent(event);
+        shellWindow?.close();
+    });
+
+    ipcMain.on("open-image-file", async (event) => {
+        const shellWindow = getShellWindowForChatViewIpcEvent(event);
+        if (!shellWindow) return;
+        const result = await dialog.showOpenDialog(shellWindow.mainWindow, {
+            filters: [
+                {
+                    name: "Image files",
+                    extensions: ["png", "jpg", "jpeg", "gif"],
+                },
+            ],
         });
 
-        try {
-            const p = Promise.withResolvers<void>();
-            server.on("error", (e) => {
-                p.reject(e);
-            });
-            server.listen(pipePath, () => {
-                debugShell("Listening for pen events on", pipePath);
-                p.resolve();
-            });
-            await p.promise;
-        } catch (e) {
-            debugShellError(`Error creating pipe at ${pipePath}: ${e}`);
+        if (result && !result.canceled) {
+            let paths = result.filePaths;
+            if (paths && paths.length > 0) {
+                const content = readFileSync(paths[0], "base64");
+                shellWindow.chatView.webContents.send(
+                    "file-selected",
+                    paths[0],
+                    content,
+                );
+            }
         }
-    }
-    await initializeInstance(instanceDir, shellSettings);
+    });
 
-    if (shellSettings.user.autoUpdate.intervalMs !== -1) {
-        startBackgroundUpdateCheck(
-            shellSettings.user.autoUpdate.intervalMs,
-            shellSettings.user.autoUpdate.restart,
-            shellSettings.user.autoUpdate.initialIntervalMs,
-        );
+    ipcMain.on("open-folder", async (event, path: string) => {
+        // Make sure the event is from the chat view of the current shell window
+        const shellWindow = getShellWindowForChatViewIpcEvent(event);
+        if (!shellWindow) return;
+        shell.openPath(path);
+    });
+
+    ipcMain.on("open-url-in-browser-tab", async (event, url: string) => {
+        // Make sure the event is from the chat view of the current shell window
+        const shellWindow = getShellWindowForChatViewIpcEvent(event);
+        if (!shellWindow) return;
+
+        // Handle custom protocol URLs
+        if (url.startsWith("typeagent-browser://")) {
+            const parsedUrl = new URL(url);
+            const pathname = parsedUrl.pathname;
+            const queryString = parsedUrl.search;
+
+            const browserExtensionUrls = (global as any).browserExtensionUrls;
+            if (browserExtensionUrls && browserExtensionUrls[pathname]) {
+                const resolvedUrl =
+                    browserExtensionUrls[pathname] + queryString;
+                shellWindow.createBrowserTab(new URL(resolvedUrl), {
+                    background: false,
+                });
+            }
+        } else if (url.startsWith("http://") || url.startsWith("https://")) {
+            // Handle HTTP/HTTPS URLs - open them in a new browser tab
+            shellWindow.createBrowserTab(new URL(url), { background: false });
+        }
+    });
+
+    await initializePen(triggerRecognitionOnce);
+    initializeSearchMenuUI();
+    initializeSpeech();
+
+    // Web view IPC handlers
+    await initializeBrowserExtension(appPath);
+    initializeExternalStorageIpcHandlers(instanceDir);
+    initializePDFViewerIpcHandlers();
+
+    initializeQuit();
+
+    app.on("activate", function () {
+        // On macOS it's common to re-create a window in the app when the
+        // dock icon is clicked and there are no other windows open.
+        if (getShellWindow() === undefined)
+            initializeInstance(instanceDir, shellSettings);
+    });
+
+    // Start up the first instance
+    const shellWindow = initializeInstance(instanceDir, shellSettings, time);
+
+    shellWindow.waitForReady().then(() => {
+        // Wait until the first shell is ready before we start background update check.
+        if (shellSettings.user.autoUpdate.intervalMs !== -1) {
+            startBackgroundUpdateCheck(
+                shellSettings.user.autoUpdate.intervalMs,
+                shellSettings.user.autoUpdate.restart,
+                shellSettings.user.autoUpdate.initialIntervalMs,
+            );
+        }
+    });
+}
+
+app.whenReady().then(initialize).catch(fatal);
+
+let reloadingInstance = false;
+export async function reloadInstance() {
+    reloadingInstance = true;
+    try {
+        await closeInstance();
+        const shellSettings = new ShellSettingManager(instanceDir);
+        await initializeInstance(instanceDir, shellSettings);
+    } finally {
+        reloadingInstance = false;
     }
 }
 
-app.whenReady()
-    .then(initialize)
-    .catch((e) => {
-        dialog.showErrorBox("Error starting shell", e.stack);
-        app.quit();
-    });
-
-function setupQuit(dispatcher: Dispatcher) {
+function initializeQuit() {
     let quitting = false;
     let canQuit = false;
     async function quit() {
@@ -592,14 +387,11 @@ function setupQuit(dispatcher: Dispatcher) {
 
         closeLocalWhisper();
 
-        debugShell("Closing dispatcher");
-        try {
-            await dispatcher.close();
-        } catch (e) {
-            debugShellError("Error closing dispatcher", e);
-        }
+        debugShellCleanup("Closing instance");
 
-        debugShell("Quitting");
+        await closeInstance(true);
+
+        debugShellCleanup("Quitting");
         canQuit = true;
         app.quit();
     }
@@ -624,7 +416,7 @@ function setupQuit(dispatcher: Dispatcher) {
 // for applications and their menu bar to stay active until the user quits
 // explicitly with Cmd + Q.
 app.on("window-all-closed", () => {
-    if (process.platform !== "darwin") {
+    if (reloadingInstance === false && process.platform !== "darwin") {
         app.quit();
     }
 });
@@ -632,7 +424,7 @@ app.on("window-all-closed", () => {
 app.on("second-instance", () => {
     // Someone tried to run a second instance, we should focus our window.
     debugShell("Second instance");
-    ShellWindow.getInstance()?.showAndFocus();
+    getShellWindow()?.showAndFocus();
 });
 
 // Similar to what electron-toolkit does with optimizer.watchWindowShortcuts, but apply to all web contents, not just browser windows.

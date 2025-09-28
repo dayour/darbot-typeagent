@@ -2,20 +2,27 @@
 // Licensed under the MIT License.
 
 import { conversation as kpLib } from "knowledge-processor";
-import { async, asyncArray } from "typeagent";
-import { error, Result } from "typechat";
+import { async, asyncArray, loadSchema } from "typeagent";
+import {
+    createJsonTranslator,
+    error,
+    PromptSection,
+    Result,
+    success,
+    TypeChatJsonTranslator,
+    TypeChatLanguageModel,
+} from "typechat";
 import { ChatModel } from "aiclient";
 import { createKnowledgeModel } from "./conversationIndex.js";
-import {
-    concreteToMergedEntities,
-    mergedToConcreteEntity,
-} from "./knowledgeMerge.js";
 import { BatchTask, runInBatches } from "./taskQueue.js";
+import { MessageTag, StructuredTag, Tag } from "./interfaces.js";
+import { createTypeScriptJsonValidator } from "typechat/ts";
+import * as knowledgeSchema2 from "./knowledgeSchema_v2.js";
 
 /**
  * Create a knowledge extractor using the given Chat Model
  * @param chatModel
- * @returns
+ * @returns Knowledge extractor
  */
 export function createKnowledgeExtractor(
     chatModel?: ChatModel,
@@ -54,24 +61,20 @@ export function extractKnowledgeFromTextBatch(
     );
 }
 
-export function mergeConcreteEntities(
-    entities: kpLib.ConcreteEntity[],
-): kpLib.ConcreteEntity[] {
-    let mergedEntities = concreteToMergedEntities(entities);
-
-    const mergedConcreteEntities: kpLib.ConcreteEntity[] = [];
-    for (const mergedEntity of mergedEntities.values()) {
-        mergedConcreteEntities.push(mergedToConcreteEntity(mergedEntity));
-    }
-    return mergedConcreteEntities;
-}
-
 export function mergeTopics(topics: string[]): string[] {
     let mergedTopics = new Set<string>();
     for (let topic of topics) {
         mergedTopics.add(topic);
     }
     return [...mergedTopics.values()];
+}
+
+export function mergeTags(tags: Tag[]): string[] {
+    let mergedText = new Set<string>();
+    for (let tag of tags) {
+        mergedText.add(tag.text);
+    }
+    return [...mergedText.values()];
 }
 
 export async function extractKnowledgeForTextBatchQ(
@@ -97,4 +100,153 @@ export async function extractKnowledgeForTextBatchQ(
         results.push(task.result ? task.result : error("No result"));
     }
     return results;
+}
+
+export function createKnowledgeResponse(): kpLib.KnowledgeResponse {
+    return {
+        entities: [],
+        actions: [],
+        inverseActions: [],
+        topics: [],
+    };
+}
+
+/**
+ * Experimental
+ * A more token efficient knowledge translator.
+ * @param translationModel
+ * @returns
+ */
+export function createKnowledgeTranslator2(
+    translationModel: TypeChatLanguageModel,
+): TypeChatJsonTranslator<kpLib.KnowledgeResponse> {
+    const translator = kpLib.createKnowledgeTranslator(translationModel);
+    const translator2 = createTranslator2(translationModel);
+    translator.createRequestPrompt = translator2.createRequestPrompt;
+    translator.translate = translate;
+    return translator;
+
+    async function translate(
+        request: string,
+        promptPreamble?: string | PromptSection[],
+    ): Promise<Result<kpLib.KnowledgeResponse>> {
+        const result = await translator2.translate(request, promptPreamble);
+        if (!result.success) {
+            return result;
+        }
+        const knowledge = knowledgeResponseFromV2(result.data);
+        return success(knowledge);
+    }
+}
+
+function createTranslator2(
+    model: TypeChatLanguageModel,
+): TypeChatJsonTranslator<knowledgeSchema2.KnowledgeResponse> {
+    const schema = loadSchema(["knowledgeSchema_v2.ts"], import.meta.url);
+    const typeName = "KnowledgeResponse";
+    const validator =
+        createTypeScriptJsonValidator<knowledgeSchema2.KnowledgeResponse>(
+            schema,
+            typeName,
+        );
+    const translator = createJsonTranslator<knowledgeSchema2.KnowledgeResponse>(
+        model,
+        validator,
+    );
+    translator.createRequestPrompt = createRequestPrompt;
+    return translator;
+
+    function createRequestPrompt(request: string) {
+        return (
+            `You are a service that translates user messages in a conversation into JSON objects of type "${typeName}" according to the following TypeScript definitions:\n` +
+            `\`\`\`\n${schema}\`\`\`\n` +
+            `The following are messages in a conversation:\n` +
+            `"""\n${request}\n"""\n` +
+            `The following is the user request translated into a JSON object with zero spaces of indentation and no properties with the value undefined:\n`
+        );
+    }
+}
+
+function knowledgeResponseFromV2(
+    response2: knowledgeSchema2.KnowledgeResponse,
+): kpLib.KnowledgeResponse {
+    const response: kpLib.KnowledgeResponse = {
+        entities: response2.entities,
+        topics: response2.topics,
+        actions: response2.actions.map((a) => actionFromAction2(a)),
+        inverseActions: [],
+    };
+    for (const action2 of response2.actions) {
+        const action = inverseActionFromAction2(action2);
+        if (action !== undefined) {
+            response.inverseActions.push(action);
+        }
+    }
+    return response;
+}
+
+function actionFromAction2(action2: knowledgeSchema2.Action): kpLib.Action {
+    const action: kpLib.Action = {
+        verbs: action2.verbs,
+        verbTense: action2.verbTense,
+        subjectEntityName: action2.subjectEntityName,
+        objectEntityName: action2.objectEntityName,
+        indirectObjectEntityName: action2.indirectObjectEntityName,
+        subjectEntityFacet: action2.subjectEntityFacet,
+    };
+    if (action2.params) {
+        action.params = action2.params;
+    }
+    return action;
+}
+
+function inverseActionFromAction2(
+    action2: knowledgeSchema2.Action,
+): kpLib.Action | undefined {
+    let inverseVerbs = action2.inverseVerbs;
+    if (inverseVerbs === undefined) {
+        return undefined;
+    }
+    inverseVerbs = inverseVerbs.filter(
+        (v) => v !== undefined && v.length > 0 && v !== kpLib.NoEntityName,
+    );
+    if (inverseVerbs.length === 0) {
+        return undefined;
+    }
+    let subjectEntityName: string | undefined;
+    let objectEntityName = kpLib.NoEntityName;
+    let indirectObjectEntityName = kpLib.NoEntityName;
+    if (action2.objectEntityName !== undefined) {
+        subjectEntityName = action2.objectEntityName;
+        objectEntityName = action2.subjectEntityName;
+    } else if (action2.indirectObjectEntityName !== undefined) {
+        subjectEntityName = action2.indirectObjectEntityName;
+        indirectObjectEntityName = action2.subjectEntityName;
+    }
+    if (
+        subjectEntityName === undefined ||
+        subjectEntityName === kpLib.NoEntityName
+    ) {
+        return undefined;
+    }
+    const action: kpLib.Action = {
+        verbs: inverseVerbs,
+        verbTense: action2.verbTense,
+        subjectEntityName,
+        objectEntityName,
+        indirectObjectEntityName,
+        subjectEntityFacet: action2.subjectEntityFacet,
+    };
+    if (action2.params) {
+        action.params = action2.params;
+    }
+    return action;
+}
+
+export function isTag(tag: MessageTag): tag is StructuredTag {
+    if (typeof tag === "object") {
+        return (tag as StructuredTag).name !== undefined;
+    }
+
+    return false;
 }

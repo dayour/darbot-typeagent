@@ -37,21 +37,22 @@
     "regen": "pnpm -C packages/cli run regen",
     "regen:builtin": "pnpm -C packages/cli run regen:builtin",
     "shell": "pnpm -C packages/shell run start",
+    "shell:dev": "pnpm -C packages/shell run dev",
     "shell:package": "pnpm -C packages/shell run package",
     "shell:start:package": "pnpm -C packages/shell run start:package",
     "shell:test": "npx --prefix packages/shell playwright test simple.spec.ts",
     "test": "pnpm run test:local && pnpm run test:live",
-    "test:live": "pnpm -r --no-sort --stream --workspace-concurrency=1 run test:live",
-    "test:local": "pnpm -r --no-sort --stream --workspace-concurrency=1 run test:local"
+    "test:live": "pnpm -r ---no-bail  -no-sort --stream --workspace-concurrency=1 run test:live",
+    "test:local": "pnpm -r --no-bail --no-sort --stream --workspace-concurrency=1 run test:local"
   },
   "devDependencies": {
-    "@fluidframework/build-tools": "^0.56.0",
+    "@fluidframework/build-tools": "^0.57.0",
     "@types/node": "^20.17.28",
     "markdown-link-check": "^3.13.7",
     "prettier": "^3.5.3",
     "shx": "^0.4.0"
   },
-  "packageManager": "pnpm@10.11.1",
+  "packageManager": "pnpm@10.17.1+sha512.17c560fca4867ae9473a3899ad84a88334914f379be46d455cbf92e5cf4b39d34985d452d2583baf19967fa76cb5c17bc9e245529d0b98745721aa7200ecaf7a",
   "engines": {
     "node": ">=20",
     "pnpm": ">=10"
@@ -78,7 +79,10 @@
         "x64",
         "arm64"
       ]
-    }
+    },
+    "ignoredBuiltDependencies": [
+      "leveldown"
+    ]
   },
   "peerDependencyRules": {
     "ignoreMissing": [

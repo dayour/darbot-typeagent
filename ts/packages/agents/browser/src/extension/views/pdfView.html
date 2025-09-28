@@ -1,0 +1,77 @@
+<!doctype html>
+<!-- Copyright (c) Microsoft Corporation.
+ Licensed under the MIT License. -->
+
+<html lang="en" dir="ltr">
+  <head>
+    <meta charset="utf-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1, maximum-scale=1"
+    />
+    <meta name="google" content="notranslate" />
+    <title>PDF Viewer - TypeAgent</title>
+
+    <!-- FontAwesome Icons -->
+    <link
+      rel="stylesheet"
+      href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css"
+    />
+    <link rel="stylesheet" href="pdfView.css" />
+  </head>
+  <body>
+    <div class="header">
+      <div>
+        <h1><i class="fas fa-file-pdf"></i> PDF Viewer</h1>
+        <div class="url-info" id="urlInfo">Loading...</div>
+      </div>
+      <div class="header-actions">
+        <button
+          class="btn btn-secondary"
+          id="backBtn"
+          onclick="window.history.back()"
+        >
+          <i class="fas fa-arrow-left"></i> Back
+        </button>
+        <button class="btn" id="openOriginalBtn" style="display: none">
+          <i class="fas fa-external-link-alt"></i> Open Original
+        </button>
+        <button class="btn" id="downloadBtn" style="display: none">
+          <i class="fas fa-download"></i> Download
+        </button>
+      </div>
+    </div>
+
+    <div id="loadingContainer" class="loading-container">
+      <div class="loading-spinner"></div>
+      <div class="loading-text">Loading PDF Viewer...</div>
+      <div class="loading-subtitle">Connecting to TypeAgent PDF reader</div>
+    </div>
+
+    <div id="errorContainer" class="error-container">
+      <div class="error-icon">
+        <i class="fas fa-exclamation-triangle"></i>
+      </div>
+      <h2 class="error-title">Unable to Load PDF</h2>
+      <p class="error-message" id="errorMessage">
+        The PDF document could not be loaded in the TypeAgent viewer.
+      </p>
+      <div class="pdf-url" id="pdfUrlDisplay"></div>
+      <div class="error-actions">
+        <button class="btn" id="retryBtn">
+          <i class="fas fa-redo"></i> Retry
+        </button>
+        <button class="btn btn-secondary" id="openInNewTabBtn">
+          <i class="fas fa-external-link-alt"></i> Open in New Tab
+        </button>
+        <button class="btn btn-secondary" onclick="window.history.back()">
+          <i class="fas fa-arrow-left"></i> Go Back
+        </button>
+      </div>
+    </div>
+
+    <iframe id="pdfFrame" src="about:blank"></iframe>
+
+    <script src="pdfView.js"></script>
+  </body>
+</html>

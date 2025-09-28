@@ -5,9 +5,42 @@ import { AppAction, isWebAgentMessageFromDispatcher } from "./types";
 import { getSettings } from "./storage";
 import { showBadgeError, showBadgeHealthy, showBadgeBusy } from "./ui";
 import { runBrowserAction } from "./browserActions";
+import { createGenericChannel } from "agent-rpc/channel";
+import { createExternalBrowserServer } from "./externalBrowserControlServer";
+
+import registerDebug from "debug";
+const debugWebSocket = registerDebug("typeagent:browser:ws");
+const debugWebSocketError = registerDebug("typeagent:browser:ws:error");
 
 let webSocket: WebSocket | undefined;
 let settings: Record<string, any>;
+
+/**
+ * Broadcasts WebSocket connection status changes to all extension pages
+ */
+function broadcastConnectionStatus(connected: boolean): void {
+    chrome.tabs.query({}, (tabs) => {
+        tabs.forEach((tab) => {
+            if (tab.url?.startsWith("chrome-extension://")) {
+                chrome.tabs
+                    .sendMessage(tab.id!, {
+                        type: "connectionStatusChanged",
+                        connected: connected,
+                        timestamp: Date.now(),
+                    })
+                    .catch(() => {});
+            }
+        });
+    });
+
+    chrome.runtime
+        .sendMessage({
+            type: "connectionStatusChanged",
+            connected: connected,
+            timestamp: Date.now(),
+        })
+        .catch(() => {});
+}
 
 /**
  * Creates a new WebSocket connection
@@ -18,24 +51,24 @@ export async function createWebSocket(): Promise<WebSocket | undefined> {
         settings = await getSettings();
     }
 
-    let socketEndpoint = settings.websocketHost ?? "ws://localhost:8080/";
+    let socketEndpoint = settings.websocketHost ?? "ws://localhost:8081/";
 
     socketEndpoint += `?channel=browser&role=client&clientId=${chrome.runtime.id}`;
     return new Promise<WebSocket | undefined>((resolve, reject) => {
         const webSocket = new WebSocket(socketEndpoint);
-        console.log("Connected to: " + socketEndpoint);
+        debugWebSocket("Connected to: " + socketEndpoint);
 
         webSocket.onopen = (event: Event) => {
-            console.log("websocket open");
+            debugWebSocket("websocket open");
             resolve(webSocket);
         };
         webSocket.onmessage = (event: MessageEvent) => {};
         webSocket.onclose = (event: CloseEvent) => {
-            console.log("websocket connection closed");
+            debugWebSocket("websocket connection closed");
             resolve(undefined);
         };
         webSocket.onerror = (event: Event) => {
-            console.error("websocket error");
+            debugWebSocketError("websocket error");
             resolve(undefined);
         };
     });
@@ -63,19 +96,97 @@ export async function ensureWebsocketConnected(): Promise<
         webSocket = await createWebSocket();
         if (!webSocket) {
             showBadgeError();
+            broadcastConnectionStatus(false);
             resolve(undefined);
             return;
         }
 
         webSocket.binaryType = "blob";
         keepWebSocketAlive(webSocket);
+        broadcastConnectionStatus(true);
 
+        const browserControlChannel = createGenericChannel((message: any) => {
+            if (webSocket && webSocket.readyState === WebSocket.OPEN) {
+                const text = JSON.stringify({
+                    source: "browserExtension",
+                    method: "browserControl/message",
+                    params: message,
+                });
+                webSocket.send(text);
+            }
+        });
+        createExternalBrowserServer(browserControlChannel.channel);
         webSocket.onmessage = async (event: MessageEvent) => {
-            const text = await (event.data as Blob).text();
-            const data = JSON.parse(text) as WebSocketMessageV2;
+            let text: string;
 
+            if (typeof event.data === "string") {
+                text = event.data;
+            } else if (event.data instanceof Blob) {
+                text = await event.data.text();
+            } else if (event.data instanceof ArrayBuffer) {
+                text = new TextDecoder().decode(event.data);
+            } else {
+                console.warn("Unknown message type:", typeof event.data);
+                return;
+            }
+
+            const data = JSON.parse(text) as WebSocketMessageV2;
             if (data.error) {
-                console.error(data.error);
+                debugWebSocketError(data.error);
+                return;
+            }
+            if (data.method === "browserControl/message") {
+                if (data.source === "browserAgent") {
+                    browserControlChannel.message(data.params);
+                }
+                return;
+            }
+
+            if (data.method === "importProgress") {
+                // Handle progress updates from the agent
+                if (data.source === "browserAgent" && data.params) {
+                    // Forward progress update to UI
+                    try {
+                        chrome.runtime
+                            .sendMessage({
+                                type: "importProgress",
+                                importId: data.params.importId,
+                                progress: data.params.progress,
+                            })
+                            .catch((error) => {
+                                console.log(
+                                    "No listeners for progress update:",
+                                    error,
+                                );
+                            });
+                    } catch (error) {
+                        console.error(
+                            "Failed to forward progress update:",
+                            error,
+                        );
+                    }
+                }
+                return;
+            }
+
+            if (data.method === "knowledgeExtractionProgress") {
+                // Handle knowledge extraction progress updates from the agent
+                if (data.source === "browserAgent" && data.params) {
+                    // Forward progress update directly to the registered callback
+                    try {
+                        const { handleKnowledgeExtractionProgress } =
+                            await import("./messageHandlers");
+                        handleKnowledgeExtractionProgress(
+                            data.params.extractionId,
+                            data.params.progress,
+                        );
+                    } catch (error) {
+                        console.error(
+                            "Failed to handle knowledge extraction progress:",
+                            error,
+                        );
+                    }
+                }
                 return;
             }
 
@@ -83,40 +194,26 @@ export async function ensureWebsocketConnected(): Promise<
                 const [schema, actionName] = data.method?.split("/");
 
                 if (schema == "browser") {
-                    if (actionName == "siteTranslatorStatus") {
-                        if (data.params.status == "initializing") {
-                            showBadgeBusy();
-                            console.log(
-                                `Initializing ${data.params.translator}`,
-                            );
-                        } else if (data.params.status == "initialized") {
-                            showBadgeHealthy();
-                            console.log(
-                                `Finished initializing ${data.params.translator}`,
-                            );
-                        }
-                    } else {
-                        const response = await runBrowserAction({
-                            actionName: actionName,
-                            parameters: data.params,
-                        });
+                    const response = await runBrowserAction({
+                        actionName: actionName,
+                        parameters: data.params,
+                    });
 
-                        webSocket?.send(
-                            JSON.stringify({
-                                id: data.id,
-                                result: response,
-                            }),
-                        );
-                    }
+                    webSocket?.send(
+                        JSON.stringify({
+                            id: data.id,
+                            result: response,
+                        }),
+                    );
                 }
             }
-            console.log(`Browser websocket client received message: ${text}`);
         };
 
         webSocket.onclose = (event: CloseEvent) => {
-            console.log("websocket connection closed");
+            debugWebSocket("websocket connection closed");
             webSocket = undefined;
             showBadgeError();
+            broadcastConnectionStatus(false);
             if (event.reason !== "duplicate") {
                 reconnectWebSocket();
             }
@@ -140,7 +237,7 @@ export function keepWebSocketAlive(webSocket: WebSocket): void {
                 }),
             );
         } else {
-            console.log("Clearing keepalive retry interval");
+            debugWebSocket("Clearing keepalive retry interval");
             clearInterval(keepAliveIntervalId);
         }
     }, 20 * 1000);
@@ -152,11 +249,12 @@ export function keepWebSocketAlive(webSocket: WebSocket): void {
 export function reconnectWebSocket(): void {
     const connectionCheckIntervalId = setInterval(async () => {
         if (webSocket && webSocket.readyState === WebSocket.OPEN) {
-            console.log("Clearing reconnect retry interval");
+            debugWebSocket("Clearing reconnect retry interval");
             clearInterval(connectionCheckIntervalId);
             showBadgeHealthy();
+            broadcastConnectionStatus(true);
         } else {
-            console.log("Retrying connection");
+            debugWebSocket("Retrying connection");
             await ensureWebsocketConnected();
         }
     }, 5 * 1000);
@@ -173,7 +271,8 @@ export async function sendActionToAgent(
     return new Promise<any | undefined>((resolve, reject) => {
         if (webSocket) {
             try {
-                const callId = new Date().getTime().toString();
+                const callId =
+                    new Date().getTime().toString() + "_" + action.actionName;
 
                 webSocket.send(
                     JSON.stringify({
@@ -184,7 +283,22 @@ export async function sendActionToAgent(
                 );
 
                 const handler = async (event: MessageEvent) => {
-                    const text = await (event.data as Blob).text();
+                    let text: string;
+
+                    if (typeof event.data === "string") {
+                        text = event.data;
+                    } else if (event.data instanceof Blob) {
+                        text = await event.data.text();
+                    } else if (event.data instanceof ArrayBuffer) {
+                        text = new TextDecoder().decode(event.data);
+                    } else {
+                        console.warn(
+                            "Unknown message type:",
+                            typeof event.data,
+                        );
+                        return;
+                    }
+
                     const data = JSON.parse(text);
                     if (data.id == callId && data.result) {
                         webSocket!.removeEventListener("message", handler);
@@ -194,7 +308,7 @@ export async function sendActionToAgent(
 
                 webSocket.addEventListener("message", handler);
             } catch {
-                console.log("Unable to contact agent backend.");
+                debugWebSocketError("Unable to contact agent backend.");
                 reject("Unable to contact agent backend.");
             }
         } else {

@@ -1,14 +1,19 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-import { ProgressBar } from "interactive-app";
+import { CommandMetadata, NamedArgs, ProgressBar } from "interactive-app";
 import * as knowLib from "knowledge-processor";
 import * as kp from "knowpro";
 import * as cm from "conversation-memory";
 import { MemoryConsoleWriter } from "../memoryWriter.js";
-import { addFileNameSuffixToPath } from "../common.js";
+import {
+    addFileNameSuffixToPath,
+    argToDate,
+    keyValuesFromNamedArgs,
+} from "../common.js";
 import path from "path";
-import { getFileName } from "typeagent";
+import { dateTime, getFileName } from "typeagent";
+import { TypeChatJsonTranslator } from "typechat";
 
 /**
  * Appends the given messages and their pre-extracted associated knowledge to the conversation index
@@ -53,69 +58,7 @@ export function textLocationToString(location: kp.TextLocation): string {
     if (location.chunkOrdinal) {
         text += `\nChunkOrdinal: ${location.chunkOrdinal}`;
     }
-    if (location.charOrdinal) {
-        text += `\nCharOrdinal: ${location.charOrdinal}`;
-    }
     return text;
-}
-
-export function termFilterToSearchGroup(
-    filter: knowLib.conversation.TermFilterV2,
-    and: boolean,
-): kp.SearchTermGroup {
-    const searchTermGroup: kp.SearchTermGroup = {
-        booleanOp: and ? "and" : "or",
-        terms: [],
-    };
-    if (filter.searchTerms && filter.searchTerms.length > 0) {
-        for (const st of filter.searchTerms) {
-            searchTermGroup.terms.push({ term: { text: st } });
-        }
-    }
-    return searchTermGroup;
-}
-
-export function termFilterToWhenFilter(
-    filter: knowLib.conversation.TermFilterV2,
-): kp.WhenFilter {
-    let when: kp.WhenFilter = {};
-    if (filter.timeRange) {
-        when.dateRange = {
-            start: knowLib.conversation.toStartDate(filter.timeRange.startDate),
-            end: knowLib.conversation.toStopDate(filter.timeRange.stopDate),
-        };
-    }
-    return when;
-}
-
-export function actionFilterToSearchGroup(
-    action: knowLib.conversation.ActionTerm,
-    and: boolean,
-): kp.SearchTermGroup {
-    const searchTermGroup: kp.SearchTermGroup = {
-        booleanOp: and ? "and" : "or",
-        terms: [],
-    };
-
-    if (action.verbs) {
-        searchTermGroup.terms.push(
-            ...action.verbs.words.map((v) => {
-                return kp.createPropertySearchTerm(kp.PropertyNames.Verb, v);
-            }),
-        );
-    }
-    if (action.subject !== "none") {
-        searchTermGroup.terms.push(
-            kp.createPropertySearchTerm(
-                kp.PropertyNames.Subject,
-                action.subject.subject,
-            ),
-        );
-    }
-    if (action.object) {
-        searchTermGroup.terms.push(kp.createSearchTerm(action.object));
-    }
-    return searchTermGroup;
 }
 
 export interface IMessageMetadata<TMeta = any> {
@@ -166,17 +109,6 @@ export function createIndexingEventHandler(
             return true;
         },
     };
-}
-
-export function hasConversationResults(
-    results: kp.ConversationSearchResult[],
-): boolean {
-    if (results.length === 0) {
-        return false;
-    }
-    return results.some((r) => {
-        return r.knowledgeMatches.size > 0 || r.messageMatches.length > 0;
-    });
 }
 
 const IndexFileSuffix = "_index.json";
@@ -235,4 +167,120 @@ export async function getLangSearchResult(
               );
 
     return searchResults;
+}
+
+export function setKnowledgeTranslator(
+    settings: kp.ConversationSettings,
+    translator: TypeChatJsonTranslator<knowLib.conversation.KnowledgeResponse>,
+) {
+    const extractor = settings.semanticRefIndexSettings.knowledgeExtractor;
+    if (extractor) {
+        extractor.translator = translator;
+    }
+}
+
+export function setKnowledgeExtractorV2(settings: kp.ConversationSettings) {
+    const extractor = settings.semanticRefIndexSettings.knowledgeExtractor;
+    if (extractor) {
+        const prevTranslator = extractor.translator;
+        extractor.translator = kp.createKnowledgeTranslator2(
+            extractor.translator!.model,
+        );
+        return prevTranslator;
+    }
+    return undefined;
+}
+
+export function* batchSemanticRefsByMessage(
+    semanticRefs: kp.ISemanticRefCollection,
+): IterableIterator<[kp.MessageOrdinal, kp.SemanticRef[]]> {
+    let srs: kp.SemanticRef[] = [];
+    let prevOrdinal: kp.MessageOrdinal = -1;
+    for (const sr of semanticRefs) {
+        if (sr.range.start.messageOrdinal !== prevOrdinal && srs.length > 0) {
+            yield [prevOrdinal, srs];
+            srs = [];
+        }
+        srs.push(sr);
+        prevOrdinal = sr.range.start.messageOrdinal;
+    }
+    if (srs.length > 0) {
+        yield [prevOrdinal, srs];
+    }
+}
+
+export function createSearchGroup(
+    termArgs: string[],
+    namedArgs: NamedArgs,
+    commandDef: CommandMetadata,
+    op: "and" | "or" | "or_max",
+): kp.SearchTermGroup {
+    const searchTerms = kp.createSearchTerms(termArgs);
+    const propertyTerms = propertyTermsFromNamedArgs(namedArgs, commandDef);
+    return {
+        booleanOp: op,
+        terms: [...searchTerms, ...propertyTerms],
+    };
+}
+
+export function propertyTermsFromNamedArgs(
+    namedArgs: NamedArgs,
+    commandDef: CommandMetadata,
+): kp.PropertySearchTerm[] {
+    const keyValues = keyValuesFromNamedArgs(namedArgs, commandDef);
+    return kp.createPropertySearchTerms(keyValues);
+}
+
+export function whenFilterFromNamedArgs(
+    conversation: kp.IConversation,
+    namedArgs: NamedArgs,
+): kp.WhenFilter {
+    let filter: kp.WhenFilter = {
+        knowledgeType: namedArgs.ktype,
+    };
+    const dateRange = kp.getTimeRangeForConversation(conversation!);
+    if (dateRange) {
+        let startDate: Date | undefined;
+        let endDate: Date | undefined;
+        // Did they provide an explicit date range?
+        if (namedArgs.startDate || namedArgs.endDate) {
+            startDate = argToDate(namedArgs.startDate) ?? dateRange.start;
+            endDate = argToDate(namedArgs.endDate) ?? dateRange.end;
+        } else {
+            // They may have provided a relative date range
+            if (namedArgs.startMinute >= 0) {
+                startDate = dateTime.addMinutesToDate(
+                    dateRange.start,
+                    namedArgs.startMinute,
+                );
+            }
+            if (namedArgs.endMinute > 0) {
+                endDate = dateTime.addMinutesToDate(
+                    dateRange.start,
+                    namedArgs.endMinute,
+                );
+            }
+        }
+        if (startDate) {
+            filter.dateRange = {
+                start: startDate,
+                end: endDate,
+            };
+        }
+    }
+    return filter;
+}
+
+export function dateRangeFromNamedArgs(
+    namedArgs: NamedArgs,
+): kp.DateRange | undefined {
+    let startDate = argToDate(namedArgs.startDate);
+    let endDate = argToDate(namedArgs.endDate);
+    if (startDate) {
+        return {
+            start: startDate,
+            end: endDate,
+        };
+    }
+    return undefined;
 }

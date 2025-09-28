@@ -7,21 +7,24 @@ import numpy as np
 from typeagent.aitools.vectorbase import (
     VectorBase,
     TextEmbeddingIndexSettings,
-    ScoredOrdinal,
 )
-from typeagent.aitools.embeddings import AsyncEmbeddingModel, NormalizedEmbedding
+from typeagent.aitools.embeddings import (
+    AsyncEmbeddingModel,
+    NormalizedEmbedding,
+    TEST_MODEL_NAME,
+)
 
-from fixtures import needs_auth
 
-
-@pytest.fixture
-def vector_base(scope="function") -> VectorBase:
+@pytest.fixture(scope="function")
+def vector_base() -> VectorBase:
     """Fixture to create a VectorBase instance with default settings."""
     return make_vector_base()
 
 
-def make_vector_base(embedding_size=3) -> VectorBase:
-    settings = TextEmbeddingIndexSettings(embedding_size=embedding_size)
+def make_vector_base() -> VectorBase:
+    settings = TextEmbeddingIndexSettings(
+        AsyncEmbeddingModel(model_name=TEST_MODEL_NAME)
+    )
     return VectorBase(settings)
 
 
@@ -38,7 +41,7 @@ def sample_embeddings() -> Samples:
     }
 
 
-def test_add_embedding(vector_base: VectorBase, sample_embeddings: Samples, needs_auth):
+def test_add_embedding(vector_base: VectorBase, sample_embeddings: Samples):
     """Test adding embeddings to the VectorBase."""
     for key, embedding in sample_embeddings.items():
         vector_base.add_embedding(key, embedding)
@@ -49,7 +52,7 @@ def test_add_embedding(vector_base: VectorBase, sample_embeddings: Samples, need
 
 
 @pytest.mark.asyncio
-async def test_add_key(vector_base: VectorBase, sample_embeddings: Samples, needs_auth):
+async def test_add_key(vector_base: VectorBase, sample_embeddings: Samples):
     """Test adding keys to the VectorBase."""
     for key in sample_embeddings:
         await vector_base.add_key(key)
@@ -58,9 +61,7 @@ async def test_add_key(vector_base: VectorBase, sample_embeddings: Samples, need
 
 
 @pytest.mark.asyncio
-async def test_add_key_no_cache(
-    vector_base: VectorBase, sample_embeddings: Samples, needs_auth
-):
+async def test_add_key_no_cache(vector_base: VectorBase, sample_embeddings: Samples):
     """Test adding keys to the VectorBase with cache disabled."""
     for key in sample_embeddings:
         await vector_base.add_key(key, cache=False)
@@ -72,9 +73,7 @@ async def test_add_key_no_cache(
 
 
 @pytest.mark.asyncio
-async def test_add_keys(
-    vector_base: VectorBase, sample_embeddings: Samples, needs_auth
-):
+async def test_add_keys(vector_base: VectorBase, sample_embeddings: Samples):
     """Test adding multiple keys to the VectorBase."""
     keys = list(sample_embeddings.keys())
     await vector_base.add_keys(keys)
@@ -83,9 +82,7 @@ async def test_add_keys(
 
 
 @pytest.mark.asyncio
-async def test_add_keys_no_cache(
-    vector_base: VectorBase, sample_embeddings: Samples, needs_auth
-):
+async def test_add_keys_no_cache(vector_base: VectorBase, sample_embeddings: Samples):
     """Test adding multiple keys to the VectorBase with cache disabled."""
     keys = list(sample_embeddings.keys())
     await vector_base.add_keys(keys, cache=False)
@@ -97,20 +94,18 @@ async def test_add_keys_no_cache(
 
 
 @pytest.mark.asyncio
-async def test_fuzzy_lookup(
-    vector_base: VectorBase, sample_embeddings: Samples, needs_auth
-):
+async def test_fuzzy_lookup(vector_base: VectorBase, sample_embeddings: Samples):
     """Test fuzzy lookup functionality."""
     for key in sample_embeddings:
         await vector_base.add_key(key)
 
-    results = await vector_base.fuzzy_lookup("word1", max_hits=2)
-    assert len(results) == 2
-    assert results[0].ordinal == 0
+    results = await vector_base.fuzzy_lookup("word1", max_hits=2, min_score=0.0)
+    assert 1 <= len(results) <= 2  # The test embedding score is random!
+    assert results[0].item == 0
     assert results[0].score > 0.9  # High similarity score for the same word
 
 
-def test_clear(vector_base: VectorBase, sample_embeddings: Samples, needs_auth):
+def test_clear(vector_base: VectorBase, sample_embeddings: Samples):
     """Test clearing the VectorBase."""
     for key, embedding in sample_embeddings.items():
         vector_base.add_embedding(key, embedding)
@@ -120,9 +115,7 @@ def test_clear(vector_base: VectorBase, sample_embeddings: Samples, needs_auth):
     assert len(vector_base) == 0
 
 
-def test_serialize_deserialize(
-    vector_base: VectorBase, sample_embeddings: Samples, needs_auth
-):
+def test_serialize_deserialize(vector_base: VectorBase, sample_embeddings: Samples):
     """Test serialization and deserialization of the VectorBase."""
     for key, embedding in sample_embeddings.items():
         vector_base.add_embedding(key, embedding)
@@ -137,3 +130,51 @@ def test_serialize_deserialize(
             new_vector_base.serialize_embedding_at(i),
             vector_base.serialize_embedding_at(i),
         )
+
+
+def test_vectorbase_bool(vector_base: VectorBase):
+    """__bool__ should always return True."""
+    assert bool(vector_base) is True
+
+
+def test_get_embedding_at(vector_base: VectorBase, sample_embeddings: Samples):
+    """Test get_embedding_at returns correct embedding and raises IndexError."""
+    for key, embedding in sample_embeddings.items():
+        vector_base.add_embedding(key, embedding)
+    # Check retrieval
+    for i, embedding in enumerate(sample_embeddings.values()):
+        result = vector_base.get_embedding_at(i)
+        np.testing.assert_array_equal(result, embedding)
+    # Out of bounds
+    with pytest.raises(IndexError):
+        vector_base.get_embedding_at(len(sample_embeddings))
+
+
+def test_fuzzy_lookup_embedding_in_subset(
+    vector_base: VectorBase, sample_embeddings: Samples
+):
+    """Test fuzzy_lookup_embedding_in_subset returns best match in subset or None."""
+    keys = list(sample_embeddings.keys())
+    for key, embedding in sample_embeddings.items():
+        vector_base.add_embedding(key, embedding)
+    # Query close to first embedding
+    query = sample_embeddings[keys[0]]
+    subset = list(range(len(keys)))
+    result = vector_base.fuzzy_lookup_embedding_in_subset(query, subset)
+    # Should return a non-empty list of ScoredInt, with the closest index first
+    assert isinstance(result, list)
+    assert len(result) > 0
+    assert hasattr(result[0], "item")
+    # The closest embedding should be among the results; check if 0 is present
+    items = [scored.item for scored in result]
+    assert 0 in items
+
+    # Subset restricts to one index
+    result = vector_base.fuzzy_lookup_embedding_in_subset(query, [1])
+    assert isinstance(result, list)
+    assert len(result) == 1
+    assert result[0].item == 1
+
+    # Empty subset returns empty list
+    result = vector_base.fuzzy_lookup_embedding_in_subset(query, [])
+    assert result == []

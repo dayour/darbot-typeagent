@@ -29,6 +29,7 @@ import {
     IPropertyToSemanticRefIndex,
     SemanticRefSearchResult,
     ISemanticRefCollection,
+    StructuredTag,
 } from "./interfaces.js";
 import {
     Match,
@@ -339,6 +340,18 @@ export function matchPropertySearchTermToSemanticRef(
     );
 }
 
+export function matchPropertySearchTermToSTag(
+    searchTerm: PropertySearchTerm,
+    semanticRef: SemanticRef,
+): boolean {
+    if (semanticRef.knowledgeType !== "sTag") {
+        return false;
+    }
+    const sTag = semanticRef.knowledge as StructuredTag;
+    // Structured tags are just entities
+    return matchConcreteEntity(searchTerm, sTag);
+}
+
 export function lookupTermFiltered(
     semanticRefIndex: ITermToSemanticRefIndex,
     term: Term,
@@ -422,9 +435,16 @@ export function lookupProperty(
 export function* lookupKnowledgeType(
     semanticRefs: ISemanticRefCollection,
     ktype: KnowledgeType,
+    textRangesInScope?: TextRangesInScope,
 ): IterableIterator<ScoredSemanticRefOrdinal> {
     for (const sr of semanticRefs) {
         if (sr.knowledgeType === ktype) {
+            if (
+                textRangesInScope !== undefined &&
+                !textRangesInScope.isRangeInScope(sr.range)
+            ) {
+                continue;
+            }
             yield { semanticRefOrdinal: sr.semanticRefOrdinal, score: 1.0 };
         }
     }
@@ -874,7 +894,7 @@ export class MatchPropertySearchTermExpr extends MatchTermExpr {
         }
     }
 
-    private lookupProperty(
+    protected lookupProperty(
         context: QueryEvalContext,
         propertyName: string,
         propertyValue: string,
@@ -895,7 +915,7 @@ export class MatchPropertySearchTermExpr extends MatchTermExpr {
         );
     }
 
-    private lookupPropertyWithoutIndex(
+    protected lookupPropertyWithoutIndex(
         context: QueryEvalContext,
         propertyName: string,
         propertyValue: string,
@@ -922,7 +942,13 @@ export class MatchTagExpr extends MatchSearchTermExpr {
         term: Term,
     ): ScoredSemanticRefOrdinal[] | undefined {
         if (isSearchTermWildcard(this.tagTerm)) {
-            return [...lookupKnowledgeType(context.semanticRefs, "tag")];
+            return [
+                ...lookupKnowledgeType(
+                    context.semanticRefs,
+                    "tag",
+                    context.textRangesInScope,
+                ),
+            ];
         }
 
         return lookupTerm(
@@ -945,7 +971,13 @@ export class MatchTopicExpr extends MatchSearchTermExpr {
         term: Term,
     ): ScoredSemanticRefOrdinal[] | undefined {
         if (isSearchTermWildcard(this.topic)) {
-            return [...lookupKnowledgeType(context.semanticRefs, "topic")];
+            return [
+                ...lookupKnowledgeType(
+                    context.semanticRefs,
+                    "topic",
+                    context.textRangesInScope,
+                ),
+            ];
         }
 
         return lookupTerm(
@@ -955,6 +987,37 @@ export class MatchTopicExpr extends MatchSearchTermExpr {
             context.textRangesInScope,
             "topic",
         );
+    }
+}
+
+export class FilterMatchTermExpr extends QueryOpExpr<
+    SemanticRefAccumulator | undefined
+> {
+    constructor(
+        public sourceExpr: IQueryOpExpr<SemanticRefAccumulator | undefined>,
+        public filter: IQuerySemanticRefPredicate,
+    ) {
+        super();
+    }
+
+    public override eval(
+        context: QueryEvalContext,
+    ): SemanticRefAccumulator | undefined {
+        const accumulator = this.sourceExpr.eval(context);
+
+        if (accumulator === undefined || accumulator.size === 0) {
+            return accumulator;
+        }
+        const filtered = new SemanticRefAccumulator(
+            accumulator.searchTermMatches,
+        );
+        filtered.setMatches(
+            accumulator.getMatches((match) => {
+                const sr = context.getSemanticRef(match.value);
+                return this.filter.eval(context, sr);
+            }),
+        );
+        return filtered;
     }
 }
 
@@ -1025,6 +1088,7 @@ export class WhereSemanticRefExpr extends QueryOpExpr<SemanticRefAccumulator> {
 
     public override eval(context: QueryEvalContext): SemanticRefAccumulator {
         const accumulator = this.sourceExpr.eval(context);
+
         if (accumulator.size === 0) {
             return accumulator;
         }
@@ -1044,8 +1108,8 @@ export class WhereSemanticRefExpr extends QueryOpExpr<SemanticRefAccumulator> {
         predicates: IQuerySemanticRefPredicate[],
         match: Match<SemanticRefOrdinal>,
     ) {
+        const semanticRef = context.getSemanticRef(match.value);
         for (let i = 0; i < predicates.length; ++i) {
-            const semanticRef = context.getSemanticRef(match.value);
             if (!predicates[i].eval(context, semanticRef)) {
                 return false;
             }

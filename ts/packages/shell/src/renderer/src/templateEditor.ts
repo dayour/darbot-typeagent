@@ -8,10 +8,10 @@ import {
     TemplateFieldScalar,
     TemplateSchema,
 } from "@typeagent/agent-sdk";
-import { TemplateData, TemplateEditConfig } from "agent-dispatcher";
+import { Dispatcher, TemplateData, TemplateEditConfig } from "agent-dispatcher";
 import { getObjectProperty, setObjectProperty } from "common-utils";
-import { getDispatcher } from "./main";
-import { SearchMenu, SearchMenuItem } from "./search";
+import { SearchMenu } from "./search";
+import { SearchMenuItem } from "./searchMenuUI/searchMenuUI";
 
 function cloneTemplateData(
     templateData: TemplateData | TemplateData[],
@@ -37,6 +37,7 @@ class FieldContainer {
     constructor(
         public readonly actionTemplates: TemplateEditConfig,
         public readonly enableEdit: boolean,
+        private readonly dispatcher: Dispatcher,
     ) {
         this.table = document.createElement("table");
         this.current = cloneTemplateData(actionTemplates.templateData);
@@ -74,7 +75,7 @@ class FieldContainer {
         );
         this.editingField = undefined;
 
-        this.current[index].schema = await getDispatcher().getTemplateSchema(
+        this.current[index].schema = await this.dispatcher.getTemplateSchema(
             this.actionTemplates.templateAgentName,
             this.actionTemplates.templateName,
             this.current[index].data,
@@ -103,7 +104,7 @@ class FieldContainer {
             return undefined;
         }
         this.editingField = field;
-        field?.startEditing();
+        field?.startEditing(this.dispatcher);
         return editingField;
     }
 }
@@ -475,6 +476,14 @@ class FieldScalar extends FieldBase {
         }
     }
 
+    private getSearchMenuPosition() {
+        if (this.editUI === undefined) {
+            return undefined;
+        }
+        const rect = this.editUI.div.getBoundingClientRect();
+        return { left: rect.left, bottom: window.innerHeight - rect.top };
+    }
+
     private createSearchMenu(
         input: HTMLInputElement,
         choices: SearchMenuItem[],
@@ -482,7 +491,7 @@ class FieldScalar extends FieldBase {
         const searchMenu = new SearchMenu((item) => {
             input.value = item.matchText;
             this.data.setEditing(this.getNextScalarField());
-        }, false);
+        });
         searchMenu.setChoices(choices);
         input.addEventListener("input", () => {
             this.updateSearchMenu();
@@ -511,9 +520,7 @@ class FieldScalar extends FieldBase {
 
     private cancelSearchMenu() {
         const searchMenu = this.editUI?.searchMenu;
-        if (searchMenu?.isActive()) {
-            searchMenu.getContainer().remove();
-        }
+        searchMenu?.hide();
     }
 
     private updateSearchMenu() {
@@ -526,17 +533,13 @@ class FieldScalar extends FieldBase {
         }
 
         const value = this.editUI.input.value;
-        const items = searchMenu.completePrefix(value);
-        if (
-            items.length !== 0 &&
-            (items.length !== 1 || items[0].matchText !== value)
-        ) {
-            if (!searchMenu.isActive()) {
-                this.editUI.div.appendChild(searchMenu.getContainer());
-            }
-        } else {
-            this.cancelSearchMenu();
+
+        const position = this.getSearchMenuPosition();
+        if (position === undefined) {
+            searchMenu.hide();
+            return;
         }
+        searchMenu.updatePrefix(value, position);
     }
     private handleSearchMenuKeys(event: KeyboardEvent): boolean {
         if (this.editUI === undefined) {
@@ -554,14 +557,14 @@ class FieldScalar extends FieldBase {
             event.preventDefault();
             return true;
         }
-        if (searchMenu.handleSpecialKeys(event, this.editUI.input.value)) {
+        if (searchMenu.handleSpecialKeys(event)) {
             event.preventDefault();
             return true;
         }
         return false;
     }
 
-    public startEditing() {
+    public startEditing(dispatcher: Dispatcher) {
         if (this.editUI === undefined) {
             return;
         }
@@ -590,7 +593,7 @@ class FieldScalar extends FieldBase {
             if (templateConfig.completion === true) {
                 const searchMenu = this.createSearchMenu(input, []);
                 this.editUI.searchMenu = searchMenu;
-                getDispatcher()
+                dispatcher
                     .getTemplateCompletion(
                         this.data.actionTemplates.templateAgentName,
                         this.data.actionTemplates.templateName,
@@ -639,7 +642,7 @@ class FieldScalar extends FieldBase {
             return true;
         }
         this.cancelSearchMenu();
-        this.editUI.searchMenu == undefined;
+        this.editUI.searchMenu = undefined;
 
         const fieldType = this.fieldType;
         const newValue = this.getInputValue(fieldType.type, input);
@@ -979,10 +982,12 @@ class FieldEditor {
 
     constructor(
         appendTo: HTMLElement,
+        dispatcher: Dispatcher,
         actionTemplates: TemplateEditConfig,
+
         enableEdit = true,
     ) {
-        this.data = new FieldContainer(actionTemplates, enableEdit);
+        this.data = new FieldContainer(actionTemplates, enableEdit, dispatcher);
         appendTo.appendChild(this.data.table);
     }
 
@@ -1011,6 +1016,7 @@ export class TemplateEditor {
 
     constructor(
         appendTo: HTMLElement,
+        dispatcher: Dispatcher,
         private readonly actionTemplates: TemplateEditConfig,
         private readonly enableEdit = true,
     ) {
@@ -1025,6 +1031,7 @@ export class TemplateEditor {
 
         this.fieldEditor = new FieldEditor(
             this.container,
+            dispatcher,
             actionTemplates,
             enableEdit,
         );

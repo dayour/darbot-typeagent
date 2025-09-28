@@ -1,7 +1,10 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-import { SchemaInfoProvider } from "../explanation/schemaInfoProvider.js";
+import {
+    isValidActionSchemaFileHash,
+    SchemaInfoProvider,
+} from "../explanation/schemaInfoProvider.js";
 import { Construction } from "./constructions.js";
 import {
     fromJsonActions,
@@ -47,8 +50,11 @@ function createConstructions(
             const schemaName = data.schemaNames[i];
             const sourceHash = data.sourceHashes[i];
             if (
-                schemaInfoProvider.getActionSchemaFileHash(schemaName) !==
-                sourceHash
+                !isValidActionSchemaFileHash(
+                    schemaInfoProvider,
+                    schemaName,
+                    sourceHash,
+                )
             ) {
                 const fileName = data.fileName ? ` in ${data.fileName}` : "";
                 const message = `Schema hash mismatch for '${schemaName}'${fileName}`;
@@ -67,6 +73,7 @@ function createConstructions(
         const requestAction = new RequestAction(
             entry.request,
             fromJsonActions(entry.action),
+            // REVIEW: imported construction doesn't support history or activities.
         );
 
         try {
@@ -81,6 +88,7 @@ function createConstructions(
             const explanation = entry.explanation;
             const namespaceKeys = getSchemaNamespaceKeys(
                 getTranslationNamesForActions(actions),
+                undefined, // REVIEW: imported construction doesn't support history or activities.
                 schemaInfoProvider,
             );
             const construction = createConstruction(
@@ -106,7 +114,9 @@ function createConstructions(
             }
             const matched = construction.match(entry.request, {
                 enableWildcard: false,
+                enableEntityWildcard: false,
                 rejectReferences: false,
+                partial: false,
             });
             if (explainer.validate !== undefined) {
                 const error = explainer.validate(requestAction, explanation);

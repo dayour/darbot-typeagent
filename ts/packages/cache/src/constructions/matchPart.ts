@@ -2,23 +2,25 @@
 // Licensed under the MIT License.
 
 import { escapeMatch } from "../utils/regexp.js";
+import {
+    MatchPartJSON,
+    MatchSetJSON,
+    TransformInfoJSON,
+} from "./constructionJSONTypes.js";
 import { ConstructionPart, WildcardMode } from "./constructions.js";
 
-export type MatchSetJSON = {
-    matches: string[];
-    basename: string;
-    namespace?: string | undefined;
-    canBeMerged: boolean;
-    index: number;
-};
-
 export type TransformInfo = {
-    namespace: string;
-    transformName: string;
-    actionIndex?: number | undefined;
+    readonly namespace: string;
+    readonly transformName: string;
+    readonly actionIndex?: number | undefined;
+
+    // Used for partial match. Number of parts that this transform requires.
+    readonly partCount: number;
 };
 
-export function toTransformInfoKey(transformInfo: TransformInfo) {
+export function toTransformInfoKey(
+    transformInfo: TransformInfo | TransformInfoJSON,
+) {
     return `${transformInfo.namespace}::${transformInfo.actionIndex ? `${transformInfo.actionIndex}.}` : ""}${transformInfo.transformName}`;
 }
 
@@ -63,6 +65,15 @@ export class MatchSet {
         // Case insensitive match
         // TODO: non-diacritic match
         this.matches = new Set(Array.from(matches).map((m) => m.toLowerCase()));
+
+        // Error checking
+        if (this.matches.has("")) {
+            throw new Error("Empty string match is not allowed");
+        }
+
+        if (this.matches.size === 0) {
+            throw new Error("Empty match set are not allowed");
+        }
     }
 
     public get fullName() {
@@ -84,7 +95,7 @@ export class MatchSet {
     public get regexPart() {
         return Array.from(this.matches)
             .sort((a, b) => b.length - a.length) // Match longest first
-            .map((m) => escapeMatch(m))
+            .map((m) => escapeMatch(m).replaceAll(/\s+/g, "\\s+")) // allow multiple spaces
             .join("|");
     }
 
@@ -128,45 +139,63 @@ export class MatchSet {
     }
 }
 
-export type MatchPartJSON = {
-    matchSet: string;
-    optional: true | undefined;
-    wildcardMode: WildcardMode | undefined;
-    transformInfos?: TransformInfo[] | undefined;
-};
+export function getPropertyNameFromTransformInfo(
+    transformInfo: TransformInfo,
+): string {
+    const { transformName, actionIndex } = transformInfo;
+    return `${actionIndex !== undefined ? `${actionIndex}.` : ""}${transformName}`;
+}
 
 export class MatchPart {
     constructor(
-        public readonly matchSet: MatchSet,
+        public readonly matchSet: MatchSet | undefined,
         public readonly optional: boolean,
         public readonly wildcardMode: WildcardMode,
         public readonly transformInfos: Readonly<TransformInfo>[] | undefined,
-    ) {}
+    ) {
+        if (wildcardMode && transformInfos === undefined) {
+            throw new Error("Wildcard part must be captured");
+        }
+        if (optional && transformInfos !== undefined) {
+            throw new Error("Optional part cannot be captured");
+        }
+        if (matchSet === undefined && wildcardMode === WildcardMode.Disabled) {
+            throw new Error(
+                "Match part must be wildcard if no matches is provided",
+            );
+        }
+    }
 
     public get capture() {
         return this.transformInfos !== undefined;
     }
 
     public get regExp() {
-        return this.matchSet.regExp;
+        return this.matchSet?.regExp;
     }
 
     public toString(verbose: boolean = false) {
-        return (
-            `<${verbose ? this.matchSet.fullName : this.matchSet.name}>` +
-            (this.optional ? "?" : "")
-        );
+        const name = this.matchSet
+            ? verbose
+                ? this.matchSet.fullName
+                : this.matchSet.name
+            : "wildcard";
+        return `<${name}>` + (this.optional ? "?" : "");
     }
 
     public toJSON(): MatchPartJSON {
         return {
-            matchSet: this.matchSet.fullName,
+            matchSet: this.matchSet?.fullName,
             optional: this.optional ? true : undefined,
             wildcardMode:
                 this.wildcardMode !== WildcardMode.Disabled
                     ? this.wildcardMode
                     : undefined,
-            transformInfos: this.transformInfos,
+            transformInfos: this.transformInfos?.map((info) => ({
+                namespace: info.namespace,
+                transformName: info.transformName,
+                actionIndex: info.actionIndex,
+            })),
         };
     }
 
@@ -179,6 +208,16 @@ export class MatchPart {
             toTransformInfosKey(e.transformInfos) ===
                 toTransformInfosKey(this.transformInfos)
         );
+    }
+
+    public getPropertyNames() {
+        return this.transformInfos
+            ? this.transformInfos.map(getPropertyNameFromTransformInfo)
+            : undefined;
+    }
+
+    public getCompletion(): Iterable<string> | undefined {
+        return this.matchSet?.matches.values();
     }
 }
 
@@ -196,17 +235,6 @@ export function createMatchPart(
     const optional = options?.optional ?? false;
     const wildcardMode = options?.wildcardMode ?? WildcardMode.Disabled;
     const transformInfos = options?.transformInfos;
-
-    // Error checking
-    if (wildcardMode && transformInfos === undefined) {
-        throw new Error("Wildcard part must be captured");
-    }
-    if (optional && transformInfos !== undefined) {
-        throw new Error("Optional part cannot be captured");
-    }
-    if (matches.some((m) => m === "")) {
-        throw new Error("Empty match is not allowed");
-    }
 
     // Add all the transform namespace and transformName to the match namespace
     // so that matches will have corresponding entry in the transforms

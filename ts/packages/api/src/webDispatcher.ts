@@ -2,13 +2,16 @@
 // Licensed under the MIT License.
 
 import { createDispatcher } from "agent-dispatcher";
+import { getConsolePrompt } from "agent-dispatcher/helpers/console";
 import { getInstanceDir, getClientId } from "agent-dispatcher/helpers/data";
+import { getStatusSummary } from "agent-dispatcher/helpers/status";
 import { createClientIORpcClient } from "agent-dispatcher/rpc/clientio/client";
 import { createDispatcherRpcServer } from "agent-dispatcher/rpc/dispatcher/server";
 import { createGenericChannel } from "agent-rpc/channel";
 import {
     getDefaultAppAgentProviders,
     getDefaultConstructionProvider,
+    getIndexingServiceRegistry,
 } from "default-agent-provider";
 import WebSocket from "ws";
 
@@ -33,30 +36,34 @@ export async function createWebDispatcher(): Promise<WebDispatcher> {
         appAgentProviders: getDefaultAppAgentProviders(instanceDir),
         persistSession: true,
         persistDir: instanceDir,
-        enableServiceHost: true,
         metrics: true,
         dblogging: true,
         clientId: getClientId(),
         clientIO: clientIO,
         constructionProvider: getDefaultConstructionProvider(),
+        indexingServiceRegistry: await getIndexingServiceRegistry(instanceDir),
     });
 
     let settingSummary: string = "";
     const updateSettingSummary = (force: boolean = false) => {
-        const newSettingSummary = dispatcher.getSettingSummary();
+        const status = dispatcher.getStatus();
+        const newSettingSummary = getStatusSummary(status);
         if (force || newSettingSummary !== settingSummary) {
             settingSummary = newSettingSummary;
             ws?.send(
                 JSON.stringify({
                     message: "setting-summary-changed",
                     data: {
-                        registeredAgents: [
-                            ...dispatcher.getTranslatorNameToEmojiMap(),
-                        ],
+                        registeredAgents: status.agents.map((agent) => [
+                            agent.name,
+                            agent.emoji,
+                        ]),
                     },
                 }),
             );
         }
+
+        return newSettingSummary;
     };
 
     async function processShellRequest(
@@ -67,7 +74,13 @@ export async function createWebDispatcher(): Promise<WebDispatcher> {
         if (typeof text !== "string" || typeof id !== "string") {
             throw new Error("Invalid request");
         }
-        console.log(dispatcher.getPrompt(), text);
+
+        // Update before processing the command in case there was change outside of command processing
+        const summary = updateSettingSummary();
+        console.log(getConsolePrompt(summary), text);
+
+        // Update before processing the command in case there was change outside of command processing
+        updateSettingSummary();
 
         const result = await dispatcher.processCommand(text, id, images);
 

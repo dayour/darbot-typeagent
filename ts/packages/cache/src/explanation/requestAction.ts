@@ -21,9 +21,11 @@ export type HistoryContext = {
 };
 
 export function normalizeParamString(str: string) {
+    // Remove diacritical marks, and case replace any space characters with the normalized ' '.
     return str
         .normalize("NFD")
-        .replace(/\p{Diacritic}/gu, "")
+        .replace(/[\u0300-\u036f]/g, "") // Remove combining diacritical marks
+        .replace(/\s+/g, " ") // Normalize any spaces to a single space
         .toLowerCase();
 }
 
@@ -38,10 +40,7 @@ export function equalNormalizedParamValue(
     return a === b || normalizeParamValue(a) === normalizeParamValue(b);
 }
 
-export function equalNormalizedParamObject(
-    a: ParamObjectType = {},
-    b: ParamObjectType = {},
-) {
+export function equalNormalizedObject(a: object = {}, b: object = {}) {
     return (
         normalizeParamString(JSON.stringify(a)) ===
         normalizeParamString(JSON.stringify(b))
@@ -104,7 +103,7 @@ export function createExecutableAction(
 const format =
     "'<request> => translator.action(<parameters>)' or '<request> => [ translator.action1(<parameters1>), translator.action2(<parameters2>), ... ]'";
 
-function parseFullActionNameParts(fullActionName: string) {
+export function splitFullActionName(fullActionName: string) {
     const parts = fullActionName.split(".");
     const schemaName = parts.slice(0, -1).join(".");
     const actionName = parts.at(-1)!;
@@ -119,7 +118,7 @@ function parseAction(action: string, index: number = -1) {
         );
     }
     const functionName = action.substring(0, leftParan);
-    const { schemaName, actionName } = parseFullActionNameParts(functionName);
+    const { schemaName, actionName } = splitFullActionName(functionName);
     if (!actionName) {
         throw new Error(
             `${index !== -1 ? `Action ${index}: ` : ""}Unable to parse action name from '${functionName}'. Input must be in the form of ${format}`,
@@ -195,9 +194,11 @@ function executableActionsToString(actions: ExecutableAction[]): string {
 }
 
 function fromJsonAction(actionJSON: JSONAction) {
-    const { schemaName, actionName } = parseFullActionNameParts(
-        actionJSON.fullActionName,
-    );
+    const { schemaName, actionName } =
+        actionJSON.fullActionName !== undefined
+            ? splitFullActionName(actionJSON.fullActionName)
+            : { schemaName: undefined as any, actionName: undefined as any };
+
     return createExecutableAction(
         schemaName,
         actionName,
@@ -291,4 +292,44 @@ export class RequestAction {
             history,
         );
     }
+}
+
+export function getPropertyInfo(
+    propertyName: string,
+    actions: ExecutableAction[],
+): {
+    action: FullAction;
+    parameterName?: string;
+    actionIndex: number | undefined;
+} {
+    const parts = propertyName.split(".");
+    let firstPart = parts.shift();
+    if (firstPart === undefined) {
+        throw new Error(`Invalid property name '${propertyName}'`);
+    }
+
+    let action: FullAction | undefined;
+    let actionIndex: number | undefined;
+    if (actions.length > 1) {
+        // Multiple actions
+        actionIndex = parseInt(firstPart);
+        if (!isNaN(actionIndex) && actionIndex.toString() === firstPart) {
+            action = actions[actionIndex].action;
+        }
+        if (action === undefined) {
+            throw new Error(
+                `Invalid index '${firstPart}' in property name '${propertyName}'`,
+            );
+        }
+        firstPart = parts.shift();
+    } else {
+        action = actions[0].action;
+    }
+    if (firstPart === "fullActionName" && parts.length === 0) {
+        return { action, actionIndex };
+    }
+    if (firstPart !== "parameters" || parts.length === 0) {
+        throw new Error(`Invalid property name '${propertyName}'`);
+    }
+    return { action, parameterName: parts.join("."), actionIndex };
 }

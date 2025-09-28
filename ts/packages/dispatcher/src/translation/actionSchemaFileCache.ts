@@ -26,6 +26,8 @@ import {
     getActionSchemaTypeName,
     getActivitySchemaTypeName,
 } from "./agentTranslators.js";
+import { getEntityPropertyTypeName } from "../execute/pendingActions.js";
+import { getActionSchema } from "./actionSchemaUtils.js";
 
 const debug = registerDebug("typeagent:dispatcher:schema:cache");
 const debugError = registerDebug("typeagent:dispatcher:schema:cache:error");
@@ -189,9 +191,11 @@ export class ActionSchemaFileCache {
         const { source, config, fullPath, format } =
             this.getSchemaSource(actionConfig);
 
-        const hash = config ? hashStrings(source, config) : hashStrings(source);
-        const cacheKey = `${format}|${actionConfig.schemaName}|${JSON.stringify(actionConfig.schemaType)}|${fullPath ?? ""}`;
-
+        const schemaTypeString = JSON.stringify(actionConfig.schemaType);
+        const hash = config
+            ? hashStrings(schemaTypeString, source, config)
+            : hashStrings(schemaTypeString, source);
+        const cacheKey = `${format}|${actionConfig.schemaName}|${schemaTypeString}|${fullPath ?? ""}`;
         const lastCached = this.prevSaved.get(cacheKey);
         if (lastCached !== undefined) {
             this.prevSaved.delete(cacheKey);
@@ -211,9 +215,6 @@ export class ActionSchemaFileCache {
             }
         }
 
-        const schemaConfig: SchemaConfig | undefined = config
-            ? JSON.parse(config)
-            : undefined;
         const parsed: ActionSchemaFile =
             format === "pas"
                 ? loadParsedActionSchema(
@@ -230,7 +231,7 @@ export class ActionSchemaFileCache {
                           actionConfig.schemaName,
                           actionConfig.schemaType,
                           fullPath,
-                          schemaConfig,
+                          config ? <SchemaConfig>JSON.parse(config) : undefined,
                           true,
                       ),
                   };
@@ -288,7 +289,7 @@ export class ActionSchemaFileCache {
     }
 }
 
-export function getActionSchema(
+export function tryGetActionSchema(
     action: DeepPartialUndefined<AppAction>,
     provider: ActionConfigProvider,
 ): ActionSchemaTypeDefinition | undefined {
@@ -305,6 +306,26 @@ export function getActionSchema(
     return actionSchemaFile.parsedActionSchema.actionSchemas.get(actionName);
 }
 
+export function getParamPatternValue<T>(
+    patternMap: Record<string, T> | undefined,
+    paramName: string,
+): T | undefined {
+    if (patternMap === undefined) {
+        return undefined;
+    }
+    for (const [key, value] of Object.entries(patternMap)) {
+        if (key.includes("*")) {
+            const regex = simpleStarRegex(key);
+            if (regex.test(paramName)) {
+                return value;
+            }
+        } else if (key === paramName) {
+            return value;
+        }
+    }
+    return undefined;
+}
+
 export function createSchemaInfoProvider(
     provider: ActionConfigProvider,
 ): SchemaInfoProvider {
@@ -314,42 +335,36 @@ export function createSchemaInfoProvider(
         );
     };
 
-    const getActionSchema = (schemaName: string, actionName: string) => {
-        const actionSchema =
-            getActionSchemaFile(
-                schemaName,
-            ).parsedActionSchema.actionSchemas.get(actionName);
-        if (actionSchema === undefined) {
-            throw new Error(
-                `Invalid action name ${actionName} for schema ${schemaName}`,
-            );
-        }
-        return actionSchema;
-    };
     const result: SchemaInfoProvider = {
         getActionSchemaFileHash: (schemaName) =>
             getActionSchemaFile(schemaName).sourceHash,
         getActionNamespace: (schemaName) =>
             getActionSchemaFile(schemaName).parsedActionSchema.actionNamespace,
         getActionCacheEnabled: (schemaName, actionName) =>
-            getActionSchema(schemaName, actionName).paramSpecs !== false,
+            getActionSchema(getActionSchemaFile(schemaName), actionName)
+                .paramSpecs !== false,
         getActionParamSpec: (schemaName, actionName, paramName) => {
-            const actionSchema = getActionSchema(schemaName, actionName);
+            const actionSchemaFile = getActionSchemaFile(schemaName);
+            const actionSchema = getActionSchema(actionSchemaFile, actionName);
             const paramSpecs = actionSchema.paramSpecs;
-            if (typeof paramSpecs !== "object") {
+            if (paramSpecs === false) {
+                // cache is disabled. This shouldn't be called, but just return undefined.
                 return undefined;
             }
-
-            for (const [key, value] of Object.entries(paramSpecs)) {
-                if (key.includes("*")) {
-                    const regex = simpleStarRegex(key);
-                    if (regex.test(paramName)) {
-                        return value;
-                    }
-                } else if (key === paramName) {
-                    return value;
-                }
+            // Check the paramSpec if there are explicit entries.
+            if (paramSpecs !== undefined) {
+                return getParamPatternValue(paramSpecs, paramName);
             }
+
+            // Check if it is an entity-type.
+            const entityPropertyTypeName = getEntityPropertyTypeName(
+                actionName,
+                paramName,
+                actionSchemaFile,
+            );
+            return entityPropertyTypeName !== undefined
+                ? "entity_wildcard"
+                : undefined;
         },
     };
     return result;

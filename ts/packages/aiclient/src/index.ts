@@ -5,7 +5,6 @@ export * from "./common.js";
 export * from "./models.js";
 export * as openai from "./openai.js";
 export * as bing from "./bing.js";
-export * as bingWithGrounding from "./bingWithGrounding.js";
 export * from "./restClient.js";
 export * from "./auth.js";
 export * from "./tokenCounter.js";
@@ -13,3 +12,5 @@ export {
     getChatModelNames,
     getChatModelMaxConcurrency,
 } from "./modelResource.js";
+export * as wikipedia from "./wikipedia.js";
+export * as wikipediaSchemas from "./wikipediaSchemas.js";

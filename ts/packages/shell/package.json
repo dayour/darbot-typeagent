@@ -68,6 +68,7 @@
     "jose": "^5.9.6",
     "markdown-it": "^14.1.0",
     "microsoft-cognitiveservices-speech-sdk": "^1.38.0",
+    "typeagent": "workspace:*",
     "typechat": "^0.1.1",
     "ws": "^8.17.1"
   },
@@ -78,15 +79,52 @@
     "@types/debug": "^4.1.12",
     "concurrently": "^9.1.2",
     "cross-env": "^7.0.3",
-    "electron": "35.2.1",
-    "electron-builder": "^26.0.16",
+    "electron": "^37.4.0",
+    "electron-builder": "^26.0.20",
     "electron-vite": "^3.1.0",
     "less": "^4.2.0",
     "rimraf": "^6.0.1",
     "run-script-os": "^1.1.6",
     "type-fest": "^4.39.1",
     "typescript": "~5.4.5",
-    "vite": "^6.2.7"
+    "vite": "^6.3.6"
+  },
+  "fluidBuild": {
+    "tasks": {
+      "build:electron:esm": {
+        "after": [
+          "^*"
+        ],
+        "files": {
+          "inputGlobs": [
+            "src/preload/**/*",
+            "src/main/**/*",
+            "src/renderer/**/*",
+            "lib/**/*",
+            "electron.vite.config.mts"
+          ],
+          "outputGlobs": [
+            "out/preload/**/*",
+            "out/main/**/*",
+            "out/renderer/**/*"
+          ]
+        }
+      },
+      "build:electron:cjs": {
+        "after": [
+          "^*"
+        ],
+        "files": {
+          "inputGlobs": [
+            "src/preload/**/*",
+            "electron.vite.preload-cjs.config.mts"
+          ],
+          "outputGlobs": [
+            "out/preload-cjs/**/*"
+          ]
+        }
+      }
+    }
   },
   "productName": "TypeAgent Shell"
 }

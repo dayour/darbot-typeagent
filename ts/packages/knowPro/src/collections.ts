@@ -150,20 +150,6 @@ export class MatchAccumulator<T = any> {
         return intersection;
     }
 
-    public intersectIter(
-        other: IterableIterator<Match<T>> | Array<Match<T>>,
-        intersection: MatchAccumulator,
-    ): MatchAccumulator {
-        for (const otherMatch of other) {
-            const thisMatch = this.getMatch(otherMatch.value);
-            if (thisMatch) {
-                this.combineMatches(thisMatch, otherMatch);
-                intersection.setMatch(thisMatch);
-            }
-        }
-        return intersection;
-    }
-
     private combineMatches(match: Match, other: Match) {
         match.hitCount += other.hitCount;
         match.score += other.score;
@@ -284,7 +270,7 @@ export class MatchAccumulator<T = any> {
     Unfortunately, a larger number of moderately related but noisy matches can overwhelm
     a small # of very good matches merely by having a larger totalScore.
     
-    2. We also want diminishing returns for too many hits. Too many hits which can be indicative of noise...as the
+    2. We also want diminishing returns for too many hits. Too many hits can be indicative of noise...as the
     they can indicate low entropy of the thing being matched: its too common-place. 
     We want to prevent runaway scores that result from too many matches
 

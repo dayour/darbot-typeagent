@@ -3,9 +3,10 @@
 
 import {
     ActionContext,
-    AppAction,
     AppAgent,
+    AppAgentInitSettings,
     AppAgentManifest,
+    CompletionGroup,
     ParsedCommandParams,
     PartialParsedCommandParams,
     SessionContext,
@@ -22,12 +23,11 @@ import {
     displayWarn,
 } from "@typeagent/agent-sdk/helpers/display";
 import { getLocalWhisperCommandHandlers } from "./localWhisperCommandHandler.js";
-import { ShellAction } from "./shellActionSchema.js";
 import { ShellWindow } from "./shellWindow.js";
 import { getObjectProperty, getObjectPropertyNames } from "common-utils";
 import { installAndRestart, updateHandlerTable } from "./commands/update.js";
-import { isProd } from "./index.js";
-import { fileURLToPath } from "node:url";
+import { isProd, reloadInstance } from "./index.js";
+import { ShellWindowState } from "./shellSettings.js";
 
 export type ShellContext = {
     shellWindow: ShellWindow;
@@ -36,13 +36,7 @@ export type ShellContext = {
 const config: AppAgentManifest = {
     emojiChar: "🐚",
     description: "Shell",
-    schema: {
-        description: "Graphical user interface (shell) for the user.",
-        schemaFile: fileURLToPath(
-            new URL("../../src/main/shellActionSchema.ts", import.meta.url),
-        ),
-        schemaType: "ShellAction",
-    },
+    localView: true,
 };
 
 class ShellShowSettingsCommandHandler implements CommandHandlerNoParams {
@@ -91,6 +85,95 @@ class ShellShowRawSettingsCommandHandler implements CommandHandlerNoParams {
     }
 }
 
+class ShellShowWindowCommandHandler implements CommandHandlerNoParams {
+    public readonly description = "Shows the shell window settings";
+    public async run(context: ActionContext<ShellContext>) {
+        const agentContext = context.sessionContext.agentContext;
+        const message: string[] = [];
+        const printConfig = (options: any, prefix: number = 2) => {
+            for (const [key, value] of Object.entries(options)) {
+                const name = `${" ".repeat(prefix)}${key.padEnd(20 - prefix)}:`;
+                if (typeof value === "object") {
+                    message.push(name);
+                    printConfig(value, prefix + 2);
+                } else if (typeof value === "function") {
+                } else {
+                    message.push(`${name} ${value}`);
+                }
+            }
+        };
+        printConfig(agentContext.shellWindow.getWindowState());
+        context.actionIO.setDisplay(message.join("\n"));
+    }
+}
+
+class ShellSetWindowSizeCommandHandler implements CommandHandler {
+    public readonly description = "Sets the shell window size";
+    public readonly parameters = {
+        args: {
+            x: {
+                description: "The new x position for the window",
+            },
+            y: {
+                description: "The new y position for the window",
+            },
+            width: {
+                description: "The new width for the window",
+            },
+            height: {
+                description: "The new height for the window",
+            },
+        },
+    } as const;
+    public async run(
+        context: ActionContext<ShellContext>,
+        params: ParsedCommandParams<typeof this.parameters>,
+    ) {
+        const agentContext = context.sessionContext.agentContext;
+        const windowState: ShellWindowState =
+            agentContext.shellWindow.getWindowState();
+
+        windowState.x = Number.parseInt(params.args.x ?? windowState.x);
+        windowState.y = Number.parseInt(params.args.y ?? windowState.y);
+        windowState.windowWidth = Number.parseInt(
+            params.args.width ?? windowState.windowWidth,
+        );
+        windowState.windowHeight = Number.parseInt(
+            params.args.height ?? windowState.windowHeight,
+        );
+
+        agentContext.shellWindow.setWindowState(windowState);
+
+        context.actionIO.setDisplay("Updated window size/position.");
+    }
+}
+
+class ShellSetZoomLevelCommandHandler implements CommandHandler {
+    public readonly description = "Sets the shell zoom level";
+    public readonly parameters = {
+        args: {
+            zoom: {
+                description:
+                    "The zoom level to set in percent (i.e. 100% is normal size, 50% is half size).",
+            },
+        },
+    } as const;
+    public async run(
+        context: ActionContext<ShellContext>,
+        params: ParsedCommandParams<typeof this.parameters>,
+    ) {
+        const agentContext = context.sessionContext.agentContext;
+        const windowState: ShellWindowState =
+            agentContext.shellWindow.getWindowState();
+
+        windowState.zoomLevel = Number.parseInt(params.args.zoom) / 100;
+
+        agentContext.shellWindow.setWindowState(windowState);
+
+        context.actionIO.setDisplay("Updated zoom level.");
+    }
+}
+
 class ShellSetSettingCommandHandler implements CommandHandler {
     public readonly description: string =
         "Sets a specific setting with the supplied value";
@@ -100,8 +183,10 @@ class ShellSetSettingCommandHandler implements CommandHandler {
                 description: "Name of the setting to set",
             },
             value: {
-                description: "The new value for the setting",
+                description:
+                    "The new value for the setting (reset to default if omitted)",
                 implicitQuotes: true,
+                optional: true,
             },
         },
     } as const;
@@ -121,15 +206,16 @@ class ShellSetSettingCommandHandler implements CommandHandler {
         context: SessionContext<ShellContext>,
         params: PartialParsedCommandParams<typeof this.parameters>,
         names: string[],
-    ): Promise<string[]> {
-        const completions: string[] = [];
+    ): Promise<CompletionGroup[]> {
+        const completions: CompletionGroup[] = [];
         for (const name of names) {
             if (name === "name") {
-                completions.push(
-                    ...getObjectPropertyNames(
+                completions.push({
+                    name,
+                    completions: getObjectPropertyNames(
                         context.agentContext.shellWindow.getUserSettings(),
                     ),
-                );
+                });
             }
 
             if (name === "value") {
@@ -139,8 +225,10 @@ class ShellSetSettingCommandHandler implements CommandHandler {
                         context.agentContext.shellWindow.getUserSettings();
                     const value = getObjectProperty(settings, settingName);
                     if (typeof value === "boolean") {
-                        completions.push("true");
-                        completions.push("false");
+                        completions.push({
+                            name,
+                            completions: ["true", "false"],
+                        });
                     }
                 }
             }
@@ -195,69 +283,6 @@ function getThemeCommandHandlers(): CommandHandlerTable {
     };
 }
 
-class ShellOpenWebContentView implements CommandHandler {
-    public readonly description = "Show a new Web Content view";
-    public readonly parameters = {
-        args: {
-            site: {
-                description: "Alias or URL for the site of the open.",
-            },
-        },
-    } as const;
-    public async run(
-        context: ActionContext<ShellContext>,
-        params: ParsedCommandParams<typeof this.parameters>,
-    ) {
-        const agentContext = context.sessionContext.agentContext;
-        let targetUrl: URL;
-        switch (params.args.site.toLowerCase()) {
-            case "paleobiodb":
-                targetUrl = new URL("https://paleobiodb.org/navigator/");
-
-                break;
-            case "crossword":
-                targetUrl = new URL(
-                    "https://aka.ms/typeagent/sample-crossword",
-                );
-
-                break;
-            case "commerce":
-                targetUrl = new URL("https://www.target.com/");
-                break;
-
-            case "turtlegraphics":
-                targetUrl = new URL("http://localhost:9000/");
-                break;
-
-            default:
-                try {
-                    const port =
-                        await context.sessionContext.getSharedLocalHostPort(
-                            params.args.site,
-                        );
-                    targetUrl = new URL(`http://localhost:${port}`);
-                } catch {
-                    try {
-                        targetUrl = new URL(params.args.site);
-                    } catch (e) {
-                        throw new Error(
-                            `Unable to open '${params.args.site}': ${e}`,
-                        );
-                    }
-                }
-                break;
-        }
-        agentContext.shellWindow.openInlineBrowser(targetUrl);
-    }
-}
-
-class ShellCloseWebContentView implements CommandHandlerNoParams {
-    public readonly description = "Close the new Web Content view";
-    public async run(context: ActionContext<ShellContext>) {
-        context.sessionContext.agentContext.shellWindow.closeInlineBrowser();
-    }
-}
-
 const handlers: CommandHandlerTable = {
     description: "Shell settings command",
     commands: {
@@ -269,6 +294,7 @@ const handlers: CommandHandlerTable = {
                 help: new ShellShowHelpCommandHandler(),
                 metrics: new ShellShowMetricsCommandHandler(),
                 raw: new ShellShowRawSettingsCommandHandler(),
+                window: new ShellShowWindowCommandHandler(),
             },
         },
         set: new ShellSetSettingCommandHandler(),
@@ -280,8 +306,6 @@ const handlers: CommandHandlerTable = {
             },
         },
         topmost: new ShellSetTopMostCommandHandler(),
-        open: new ShellOpenWebContentView(),
-        close: new ShellCloseWebContentView(),
         localWhisper: getLocalWhisperCommandHandlers(),
         theme: getThemeCommandHandlers(),
         update: updateHandlerTable,
@@ -296,38 +320,27 @@ const handlers: CommandHandlerTable = {
                 installAndRestart();
             },
         },
+        setWindowState: new ShellSetWindowSizeCommandHandler(),
+        setWindowZoomLevel: new ShellSetZoomLevelCommandHandler(),
+        reload: {
+            description: "Reload the shell",
+            run: async () => {
+                reloadInstance();
+                // displaySuccess("Reloading shell...", context);
+            },
+        },
     },
 };
 
 export function createShellAgentProvider(shellWindow: ShellWindow) {
     const agent: AppAgent = {
-        async initializeAgentContext(): Promise<ShellContext> {
+        async initializeAgentContext(
+            settings: AppAgentInitSettings,
+        ): Promise<ShellContext> {
+            shellWindow.startChatServer(settings.localHostPort ?? -1);
             return {
                 shellWindow,
             };
-        },
-        async executeAction(
-            action: AppAction,
-            context: ActionContext<ShellContext>,
-        ) {
-            const shellAction = action as ShellAction;
-            switch (shellAction.actionName) {
-                case "openCanvas":
-                    const openCmd = new ShellOpenWebContentView();
-                    const parameters = {
-                        args: {
-                            site: shellAction.parameters.site,
-                        },
-                    };
-                    openCmd.run(context, parameters as any);
-                    break;
-                case "closeCanvas":
-                    const closeCmd = new ShellCloseWebContentView();
-                    closeCmd.run(context);
-                    break;
-            }
-
-            return undefined;
         },
         ...getCommandInterface(handlers),
     };

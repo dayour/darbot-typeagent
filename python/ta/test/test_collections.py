@@ -1,11 +1,13 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
+import pytest
+
 from typeagent.knowpro.collections import (
     Match,
     MatchAccumulator,
     PropertyTermSet,
-    ScoredItem,
+    Scored,
     SemanticRefAccumulator,
     TermSet,
     TextRangeCollection,
@@ -24,7 +26,7 @@ from typeagent.knowpro.interfaces import (
     Term,
 )
 from typeagent.knowpro.kplib import Action, ConcreteEntity
-from typeagent.knowpro.storage import SemanticRefCollection
+from typeagent.storage.memory.collections import MemorySemanticRefCollection
 
 
 def test_match_accumulator_add_and_get():
@@ -61,7 +63,7 @@ def test_match_accumulator_get_matches_with_min_hit_count():
     accumulator.add("example1", score=0.5)
     accumulator.add("example2", score=2.0)
 
-    matches = list(accumulator._matches_with_min_hit_count(min_hit_count=2))
+    matches = list(accumulator._matches_with_min_hit_count(min_hit_count=2))  # type: ignore  # Need an internal method.
     assert len(matches) == 1
     assert matches[0].value == "example1"
 
@@ -133,7 +135,8 @@ def test_text_ranges_in_scope():
     assert not ranges_in_scope.is_range_in_scope(range4)
 
 
-def test_semantic_ref_accumulator_group_matches_by_type():
+@pytest.mark.asyncio
+async def test_semantic_ref_accumulator_group_matches_by_type():
     """Test grouping matches by knowledge type in SemanticRefAccumulator."""
     accumulator = SemanticRefAccumulator()
     accumulator.add(0, score=0.8)
@@ -143,18 +146,16 @@ def test_semantic_ref_accumulator_group_matches_by_type():
         SemanticRef(
             0,
             range=TextRange(TextLocation(0)),
-            knowledge_type="entity",
             knowledge=ConcreteEntity("ref1", ["ref"]),
         ),
         SemanticRef(
             1,
             range=TextRange(TextLocation(2)),
-            knowledge_type="action",
             knowledge=Action(["go"], "past"),
         ),
     ]
 
-    groups = accumulator.group_matches_by_type(SemanticRefCollection(refs))
+    groups = await accumulator.group_matches_by_type(MemorySemanticRefCollection(refs))
     assert len(groups) == 2
     assert "entity" in groups
     assert "action" in groups
@@ -325,7 +326,8 @@ def test_property_term_set_clear():
     assert property_term_set.has("property2", "value2") is False
 
 
-def test_semantic_ref_accumulator_get_semantic_refs():
+@pytest.mark.asyncio
+async def test_semantic_ref_accumulator_get_semantic_refs():
     """Test retrieving semantic references with a predicate."""
     accumulator = SemanticRefAccumulator()
     accumulator.add(0, score=1.0)
@@ -335,28 +337,27 @@ def test_semantic_ref_accumulator_get_semantic_refs():
         SemanticRef(
             0,
             range=TextRange(TextLocation(0)),
-            knowledge_type="entity",
             knowledge=ConcreteEntity("ref1", ["ref"]),
         ),
         SemanticRef(
             1,
             range=TextRange(TextLocation(2)),
-            knowledge_type="action",
             knowledge=Action(["go"], "past"),
         ),
     ]
 
-    semantic_refs = SemanticRefCollection(refs)
+    semantic_refs = MemorySemanticRefCollection(refs)
 
     # Predicate to filter only "entity" knowledge type
-    predicate = lambda ref: ref.knowledge_type == "entity"
-    filtered_refs = list(accumulator.get_semantic_refs(semantic_refs, predicate))
+    predicate = lambda ref: ref.knowledge.knowledge_type == "entity"
+    filtered_refs = await accumulator.get_semantic_refs(semantic_refs, predicate)
 
     assert len(filtered_refs) == 1
-    assert filtered_refs[0].knowledge_type == "entity"
+    assert filtered_refs[0].knowledge.knowledge_type == "entity"
 
 
-def test_semantic_ref_accumulator_get_matches_in_scope():
+@pytest.mark.asyncio
+async def test_semantic_ref_accumulator_get_matches_in_scope():
     """Test filtering matches by scope in SemanticRefAccumulator."""
     accumulator = SemanticRefAccumulator()
     accumulator.add(0, score=1.0)
@@ -366,23 +367,21 @@ def test_semantic_ref_accumulator_get_matches_in_scope():
         SemanticRef(
             0,
             range=TextRange(TextLocation(0), TextLocation(10)),
-            knowledge_type="entity",
             knowledge=ConcreteEntity("ref1", ["ref"]),
         ),
         SemanticRef(
             1,
             range=TextRange(TextLocation(20), TextLocation(30)),
-            knowledge_type="action",
             knowledge=Action(["go"], "past"),
         ),
     ]
 
-    semantic_refs = SemanticRefCollection(refs)
+    semantic_refs = MemorySemanticRefCollection(refs)
     ranges_in_scope = TextRangesInScope(
         [TextRangeCollection([TextRange(TextLocation(0), TextLocation(15))])]
     )
 
-    filtered_accumulator = accumulator.get_matches_in_scope(
+    filtered_accumulator = await accumulator.get_matches_in_scope(
         semantic_refs, ranges_in_scope
     )
 
@@ -448,9 +447,9 @@ def test_top_n_collection():
 def test_get_top_k():
     """Test retrieving the top K items from an unsorted list."""
     items = [
-        ScoredItem(item="low", score=0.5),
-        ScoredItem(item="medium", score=1.0),
-        ScoredItem(item="high", score=2.0),
+        Scored(item="low", score=0.5),
+        Scored(item="medium", score=1.0),
+        Scored(item="high", score=2.0),
     ]
 
     top_k = get_top_k(items, top_k=2)

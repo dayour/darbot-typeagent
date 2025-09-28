@@ -1,23 +1,22 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-from dataclasses import dataclass, field
 import os
 import re
-from typing import cast, Sequence
 
-from ..knowpro.importing import ConversationSettings
-from ..knowpro.interfaces import Datetime, IMessageCollection, MessageOrdinal
-from ..knowpro.storage import MessageCollection
-from .podcast import Podcast, PodcastMessage
+from ..knowpro.convsettings import ConversationSettings
+from ..knowpro.interfaces import Datetime
+from ..storage.utils import create_storage_provider
+from .podcast import Podcast, PodcastMessage, PodcastMessageMeta
 
 
-def import_podcast(
+async def import_podcast(
     transcript_file_path: str,
+    settings: ConversationSettings,
     podcast_name: str | None = None,
     start_date: Datetime | None = None,
     length_minutes: float = 60.0,
-    settings: ConversationSettings | None = None,
+    dbname: str | None = None,
 ) -> Podcast:
     with open(transcript_file_path, "r") as f:
         transcript_lines = f.readlines()
@@ -42,8 +41,9 @@ def import_podcast(
     """
     turn_parse_regex = re.compile(regex)
     participants: set[str] = set()
-    msgs = MessageCollection[PodcastMessage]()
+
     cur_msg: PodcastMessage | None = None
+    msgs: list[PodcastMessage] = []
     for line in transcript_lines:
         match = turn_parse_regex.match(line)
         if match:
@@ -62,26 +62,44 @@ def import_podcast(
             if not cur_msg:
                 if speaker:
                     participants.add(speaker)
-                cur_msg = PodcastMessage(speaker, [], [speech])
+                metadata = PodcastMessageMeta(speaker)
+                cur_msg = PodcastMessage([speech], metadata)
     if cur_msg:
         msgs.append(cur_msg)
 
     assign_message_listeners(msgs, participants)
 
-    pod = Podcast(
-        podcast_name, msgs, [podcast_name], settings=settings or ConversationSettings()
+    provider = await create_storage_provider(
+        settings.message_text_index_settings,
+        settings.related_term_index_settings,
+        dbname,
+        PodcastMessage,
+    )
+    msg_coll = await provider.get_message_collection()
+    semref_coll = await provider.get_semantic_ref_collection()
+    if await msg_coll.size() or await semref_coll.size():
+        raise RuntimeError(f"{dbname!r} already has messages or semantic refs.")
+
+    await msg_coll.extend(msgs)
+
+    pod = await Podcast.create(
+        settings,
+        name_tag=podcast_name,
+        messages=msg_coll,
+        tags=[podcast_name],
+        semantic_refs=semref_coll,
     )
     if start_date:
-        pod.generate_timestamps(start_date, length_minutes)
+        await pod.generate_timestamps(start_date, length_minutes)
     # TODO: Add more tags.
     return pod
 
 
 def assign_message_listeners(
-    msgs: IMessageCollection[PodcastMessage],
+    msgs: list[PodcastMessage],
     participants: set[str],
 ) -> None:
     for msg in msgs:
-        if msg.speaker:
-            listeners = [p for p in participants if p != msg.speaker]
-            msg.listeners = listeners
+        if msg.metadata.speaker:
+            listeners = [p for p in participants if p != msg.metadata.speaker]
+            msg.metadata.listeners = listeners

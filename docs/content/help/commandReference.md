@@ -22,6 +22,50 @@ Usage: `@browser launch standalone`
 ## @browser close - Close the new Web Content view  
 Usage: `@browser close`  
 
+## @browser resolver list - List all available URL resolvers
+Usage: `@browser resolver list` 
+
+## @browser resolver search - Toggle search resolver
+Usage: `@browser resolver search` 
+
+## @browser resolver keyword - Toggle keyword resolver
+Usage: `@browser resolver keyword` 
+
+## @browser resolver wikipedia - Toggle Wikipedia resolver
+Usage: `@browser resolver wikipedia` 
+
+## @browser resolver history - Toggle history resolver
+Usage: `@browser resolver history` 
+
+## @browser search list - Lists browser agent search providers
+Usage: `@browser search list` 
+
+## @browser search set - Sets the active search provider
+Usage: `@browser search set <provider>`
+Arguments:
+  &lt;provider&gt; - The name of the search provider to set as active. (type: string)
+
+## @browser search show - Shows the details of the selected search provider
+Usage: `@browser search show <provider>`
+Arguments:
+  &lt;provider&gt; - The name of the search provider to show details for. (type: string)
+
+## @browser search add - Adds a new search provider
+Usage: `@browser search add <provider> <url>`
+Arguments:
+  &lt;provider&gt; - The name of the search provider to add. (type: string)
+  &lt;url&gt; - The URL of the search provider to add. '%s' will be replaced with the search parameter. (type: string)
+
+## @browser search remove - Removes the selected search provider
+Usage: `@browser search remove <provider>`
+Arguments:
+  &lt;provider&gt; - The name of the search provider to remove. (type: string)
+
+## @browser search import - Imports the search providers from the specified browser
+Usage: `@browser search import <browser>`
+Arguments:
+  &lt;browser&gt; - The name of the browser to import search providers from: [Edge | Chrome]. (type: string)
+
 ## @calendar login - Log into MS Graph to access calendar  
 Usage: `@calendar login`  
 
@@ -409,6 +453,14 @@ Usage: `@history delete <index>`
 ### Arguments:  
   - &lt;index&gt; - Chat history index to delete. (type: number)  
    
+## @history entities list - Shows all of the entities currently in 'working memory.'
+Usage: `@history entities list` 
+
+## @history entities delete - Delete entities from the chat history (working memory).
+Usage: `@history entities delete <entityId>`
+Arguments:
+  - &lt;entityId&gt; - The UniqueId of the entity (type: string)
+
 ## @history insert - Insert messages to chat history  
 Usage: `@history insert <messages>`  
 ### Arguments:  

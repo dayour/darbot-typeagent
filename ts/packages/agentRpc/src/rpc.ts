@@ -3,44 +3,42 @@
 
 import registerDebug from "debug";
 
-const debugIn = registerDebug("typeagent:rpc:in");
-const debugOut = registerDebug("typeagent:rpc:out");
-const debugError = registerDebug("typeagent:rpc:error");
-
 import { RpcChannel } from "./common.js";
 
-type RpcFuncType<
+type RpcFuncTypes<
     N extends string,
-    T extends Record<string, (...args: any) => any>,
+    T extends Record<string, (...args: any[]) => any>,
 > = {
     [K in keyof T as `${N}`]: <K extends string>(
         name: K,
-        param: Parameters<T[K]>[0],
+        ...args: Parameters<T[K]>
     ) => ReturnType<T[K]>;
 };
 
+type RpcInvokeFunction = (...args: any[]) => Promise<unknown>;
+type RpcCallFunction = (...args: any[]) => void;
+type RpcInvokeFunctions = Record<string, RpcInvokeFunction>;
+type RpcCallFunctions = Record<string, RpcCallFunction>;
 type RpcReturn<
-    InvokeTargetFunctions extends {
-        [key: string]: (param: any) => Promise<unknown>;
-    },
-    CallTargetFunctions extends { [key: string]: (param: any) => void },
-> = RpcFuncType<"invoke", InvokeTargetFunctions> &
-    RpcFuncType<"send", CallTargetFunctions>;
+    InvokeTargetFunctions extends RpcInvokeFunctions,
+    CallTargetFunctions extends RpcCallFunctions,
+> = RpcFuncTypes<"invoke", InvokeTargetFunctions> &
+    RpcFuncTypes<"send", CallTargetFunctions>;
 
 export function createRpc<
-    InvokeTargetFunctions extends {
-        [key: string]: (param: any) => Promise<unknown>;
-    } = {},
-    CallTargetFunctions extends { [key: string]: (param: any) => void } = {},
-    InvokeHandlers extends {
-        [key: string]: (param: any) => Promise<unknown>;
-    } = {},
-    CallHandlers extends { [key: string]: (param: any) => void } = {},
+    InvokeTargetFunctions extends RpcInvokeFunctions = {},
+    CallTargetFunctions extends RpcCallFunctions = {},
+    InvokeHandlers extends RpcInvokeFunctions = {},
+    CallHandlers extends RpcCallFunctions = {},
 >(
+    name: string, // for debugging only.
     channel: RpcChannel,
     invokeHandlers?: InvokeHandlers,
     callHandlers?: CallHandlers,
 ): RpcReturn<InvokeTargetFunctions, CallTargetFunctions> {
+    const debugIn = registerDebug(`typeagent:${name}:rpc:in`);
+    const debugOut = registerDebug(`typeagent:${name}:rpc:out`);
+    const debugError = registerDebug(`typeagent:${name}:rpc:error`);
     const pending = new Map<
         number,
         {
@@ -49,7 +47,7 @@ export function createRpc<
         }
     >();
 
-    const out = (message: any, cbErr?: (err: Error | null) => void) => {
+    const out = (message: RpcMessage, cbErr?: (err: Error | null) => void) => {
         debugOut(message);
         channel.send(message, cbErr);
     };
@@ -61,7 +59,7 @@ export function createRpc<
             if (f === undefined) {
                 debugError("No call handler", message);
             } else {
-                f(message.param);
+                f(...message.args);
             }
             return;
         }
@@ -71,10 +69,10 @@ export function createRpc<
                 out({
                     type: "invokeError",
                     callId: message.callId,
-                    error: "No invoke handler",
+                    error: `No invoke handler ${message.name}`,
                 });
             } else {
-                f(message.param).then(
+                f(...message.args).then(
                     (result) => {
                         out({
                             type: "invokeResult",
@@ -87,6 +85,7 @@ export function createRpc<
                             type: "invokeError",
                             callId: message.callId,
                             error: error.message,
+                            stack: debugError.enabled ? error.stack : undefined,
                         });
                     },
                 );
@@ -105,6 +104,7 @@ export function createRpc<
         if (isInvokeResult(message)) {
             r.resolve(message.result);
         } else {
+            debugError("Invoke error", message.stack);
             r.reject(new Error(message.error));
         }
     };
@@ -125,32 +125,33 @@ export function createRpc<
 
     let nextCallId = 0;
     const rpc = {
-        invoke: async function <P, T>(
+        invoke: async function (
             name: keyof InvokeTargetFunctions,
-            param: P,
-        ): Promise<T> {
-            const message = {
+            ...args: any[]
+        ): Promise<any> {
+            const message: InvokeMessage = {
                 type: "invoke",
                 callId: nextCallId++,
-                name,
-                param,
+                name: name as string,
+                args,
             };
 
-            return new Promise<T>((resolve, reject) => {
+            return new Promise<any>((resolve, reject) => {
                 out(message, (err) => {
                     if (err !== null) {
+                        pending.delete(message.callId);
                         reject(err);
                     }
                 });
                 pending.set(message.callId, { resolve, reject });
             });
         },
-        send: <P>(name: keyof CallTargetFunctions, param?: P) => {
+        send: (name: keyof CallTargetFunctions, ...args: any[]) => {
             out({
                 type: "call",
                 callId: nextCallId++,
-                name,
-                param,
+                name: name as string,
+                args,
             });
         },
     } as RpcReturn<InvokeTargetFunctions, CallTargetFunctions>;
@@ -175,26 +176,29 @@ function isInvokeError(message: any): message is InvokeError {
 
 type CallMessage = {
     type: "call";
-    callId: number;
+    callId: number; // Not necessary for call messages. included for tracing.
     name: string;
-    param: any;
+    args: any[];
 };
 
 type InvokeMessage = {
     type: "invoke";
     callId: number;
     name: string;
-    param: any;
+    args: any[];
 };
 
-type InvokeResult<T = void> = {
+type InvokeResult = {
     type: "invokeResult";
     callId: number;
-    result: T;
+    result: any;
 };
 
 type InvokeError = {
     type: "invokeError";
     callId: number;
     error: string;
+    stack?: string; // Optional stack trace for debugging.
 };
+
+type RpcMessage = CallMessage | InvokeMessage | InvokeResult | InvokeError;

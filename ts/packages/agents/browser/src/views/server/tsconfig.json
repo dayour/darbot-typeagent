@@ -1,0 +1,9 @@
+{
+  "extends": "../../../../../../tsconfig.base.json",
+  "compilerOptions": {
+    "outDir": "../../../dist/views/server",
+    "rootDir": "."
+  },
+  "include": ["./**/*.mts"],
+  "references": [{ "path": "../shared" }]
+}

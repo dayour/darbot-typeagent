@@ -5,6 +5,7 @@ import {
     AppAgent,
     SessionContext,
     AppAgentManifest,
+    AppAgentInitSettings,
 } from "@typeagent/agent-sdk";
 import { CommandHandlerContext } from "./commandHandlerContext.js";
 import {
@@ -16,7 +17,7 @@ import {
     ActionSchemaFile,
 } from "../translation/actionConfigProvider.js";
 import { getAppAgentName } from "../translation/agentTranslators.js";
-import { createSessionContext } from "../execute/actionHandlers.js";
+import { createSessionContext } from "../execute/sessionContext.js";
 import { AppAgentProvider } from "../agentProvider/agentProvider.js";
 import registerDebug from "debug";
 import { DispatcherName } from "./dispatcher/dispatcherUtils.js";
@@ -93,7 +94,6 @@ export const alwaysEnabledAgents = {
 export class AppAgentManager implements ActionConfigProvider {
     private readonly agents = new Map<string, AppAgentRecord>();
     private readonly actionConfigs = new Map<string, ActionConfig>();
-    private readonly emojis: Record<string, string> = {};
     private readonly transientAgents: Record<string, boolean | undefined> = {};
     private readonly actionSemanticMap?: ActionSchemaSemanticMap;
     private readonly actionSchemaFileCache: ActionSchemaFileCache;
@@ -102,6 +102,7 @@ export class AppAgentManager implements ActionConfigProvider {
         cacheDir: string | undefined,
         private readonly portBase: number,
         private readonly allowSharedLocalView?: string[],
+        private readonly agentInitOptions?: Record<string, unknown>,
     ) {
         this.actionSchemaFileCache = new ActionSchemaFileCache(
             cacheDir
@@ -125,6 +126,12 @@ export class AppAgentManager implements ActionConfigProvider {
         const record = this.getRecord(appAgentName);
         return record.manifest.description;
     }
+
+    public getAppAgentEmoji(appAgentName: string) {
+        const record = this.getRecord(appAgentName);
+        return record.manifest.emojiChar;
+    }
+
     public getLocalHostPort(appAgentName: string) {
         const record = this.getRecord(appAgentName);
         return record.port;
@@ -137,8 +144,8 @@ export class AppAgentManager implements ActionConfigProvider {
         // about whether agent exists or not.
         if (
             record === undefined ||
-            (!this.allowSharedLocalView?.includes(requester) &&
-                record.manifest.sharedLocalView?.includes(requester) !== true)
+            (!this.allowSharedLocalView?.includes(requester) && // host declare allowed agents to share
+                record.manifest.sharedLocalView?.includes(requester) !== true) // agent declared allowed agents to share.
         ) {
             throw new Error(
                 `Agent '${requester}' is not allowed to access '${target}' local view.`,
@@ -215,10 +222,6 @@ export class AppAgentManager implements ActionConfigProvider {
             : undefined;
     }
 
-    public getEmojis(): Readonly<Record<string, string>> {
-        return this.emojis;
-    }
-
     public async semanticSearchActionSchema(
         request: string,
         maxMatches: number = 1,
@@ -270,7 +273,6 @@ export class AppAgentManager implements ActionConfigProvider {
         for (const [schemaName, config] of entries) {
             debug(`Adding action config: ${schemaName}`);
             this.actionConfigs.set(schemaName, config);
-            this.emojis[schemaName] = config.emojiChar;
             if (config.transient) {
                 this.transientAgents[schemaName] = false;
             }
@@ -291,8 +293,6 @@ export class AppAgentManager implements ActionConfigProvider {
                 schemaErrors.set(schemaName, e);
             }
         }
-
-        this.emojis[appAgentName] = manifest.emojiChar;
 
         const port = manifest.localView
             ? this.portBase + this.nextPortIndex++
@@ -341,12 +341,10 @@ export class AppAgentManager implements ActionConfigProvider {
     }
 
     private cleanupAgent(appAgentName: string) {
-        delete this.emojis[appAgentName];
         for (const [schemaName, config] of this.actionConfigs) {
             if (getAppAgentName(schemaName) !== appAgentName) {
                 continue;
             }
-            delete this.emojis[schemaName];
             this.actionConfigs.delete(schemaName);
             this.actionSchemaFileCache.unloadActionSchemaFile(schemaName);
             this.actionSemanticMap?.removeActionSchemaFile(schemaName);
@@ -391,7 +389,7 @@ export class AppAgentManager implements ActionConfigProvider {
     public getAppAgent(appAgentName: string): AppAgent {
         const record = this.getRecord(appAgentName);
         if (record.appAgent === undefined) {
-            throw new Error(`App agent' ${appAgentName}' is not initialized`);
+            throw new Error(`App agent '${appAgentName}' is not initialized`);
         }
         return record.appAgent;
     }
@@ -636,13 +634,20 @@ export class AppAgentManager implements ActionConfigProvider {
         const appAgent = await this.ensureAppAgent(record);
         let agentContext: unknown | undefined;
         if (appAgent.initializeAgentContext !== undefined) {
-            let settings =
+            const options = this.agentInitOptions?.[record.name];
+            let settings: AppAgentInitSettings | undefined =
                 record.port !== undefined
                     ? {
                           localHostPort: record.port,
                       }
                     : undefined;
 
+            if (options !== undefined) {
+                if (settings === undefined) {
+                    settings = {};
+                }
+                settings.options = options;
+            }
             agentContext = await callEnsureError(() =>
                 appAgent.initializeAgentContext!(settings),
             );

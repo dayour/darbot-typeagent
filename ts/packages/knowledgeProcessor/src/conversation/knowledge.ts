@@ -26,7 +26,10 @@ export interface KnowledgeExtractor {
         message: string,
         maxRetries: number,
     ): Promise<Result<KnowledgeResponse>>;
-    translator?: TypeChatJsonTranslator<KnowledgeResponse>;
+    /**
+     * Custom translator to use
+     */
+    translator?: TypeChatJsonTranslator<KnowledgeResponse> | undefined;
 }
 
 export type KnowledgeExtractorSettings = {
@@ -35,18 +38,27 @@ export type KnowledgeExtractorSettings = {
     mergeEntityFacets?: boolean;
 };
 
+/**
+ * Create a new knowledge extractor
+ * @param model
+ * @param extractorSettings
+ * @param knowledgeTranslator (optional) knowledge translator to use
+ * @returns
+ */
 export function createKnowledgeExtractor(
     model: TypeChatLanguageModel,
     extractorSettings?: KnowledgeExtractorSettings | undefined,
+    knowledgeTranslator?: TypeChatJsonTranslator<KnowledgeResponse> | undefined,
 ): KnowledgeExtractor {
     const settings = extractorSettings ?? createKnowledgeExtractorSettings();
-    const translator = createTranslator(model);
-    return {
+    const translator = knowledgeTranslator ?? createKnowledgeTranslator(model);
+    const extractor: KnowledgeExtractor = {
         settings,
         extract,
         extractWithRetry,
         translator,
     };
+    return extractor;
 
     async function extract(
         message: string,
@@ -71,40 +83,15 @@ export function createKnowledgeExtractor(
     async function extractKnowledge(
         message: string,
     ): Promise<Result<KnowledgeResponse>> {
-        const result = await translator.translate(message);
+        const result = await (extractor.translator ?? translator).translate(
+            message,
+        );
         if (result.success) {
             if (settings.mergeActionKnowledge || settings.mergeEntityFacets) {
                 mergeActionKnowledge(result.data);
             }
         }
         return result;
-    }
-
-    function createTranslator(
-        model: TypeChatLanguageModel,
-    ): TypeChatJsonTranslator<KnowledgeResponse> {
-        const schema = loadSchema(["knowledgeSchema.ts"], import.meta.url);
-        const typeName = "KnowledgeResponse";
-        const validator = createTypeScriptJsonValidator<KnowledgeResponse>(
-            schema,
-            typeName,
-        );
-        const translator = createJsonTranslator<KnowledgeResponse>(
-            model,
-            validator,
-        );
-        translator.createRequestPrompt = createRequestPrompt;
-        return translator;
-
-        function createRequestPrompt(request: string) {
-            return (
-                `You are a service that translates user messages in a conversation into JSON objects of type "${typeName}" according to the following TypeScript definitions:\n` +
-                `\`\`\`\n${schema}\`\`\`\n` +
-                `The following are messages in a conversation:\n` +
-                `"""\n${request}\n"""\n` +
-                `The following is the user request translated into a JSON object with 2 spaces of indentation and no properties with the value undefined:\n`
-            );
-        }
     }
 
     //
@@ -138,6 +125,33 @@ export function createKnowledgeExtractor(
                 }
             }
         }
+    }
+}
+
+export function createKnowledgeTranslator(
+    model: TypeChatLanguageModel,
+): TypeChatJsonTranslator<KnowledgeResponse> {
+    const schema = loadSchema(["knowledgeSchema.ts"], import.meta.url);
+    const typeName = "KnowledgeResponse";
+    const validator = createTypeScriptJsonValidator<KnowledgeResponse>(
+        schema,
+        typeName,
+    );
+    const translator = createJsonTranslator<KnowledgeResponse>(
+        model,
+        validator,
+    );
+    translator.createRequestPrompt = createRequestPrompt;
+    return translator;
+
+    function createRequestPrompt(request: string) {
+        return (
+            `You are a service that translates user messages in a conversation into JSON objects of type "${typeName}" according to the following TypeScript definitions:\n` +
+            `\`\`\`\n${schema}\`\`\`\n` +
+            `The following are messages in a conversation:\n` +
+            `"""\n${request}\n"""\n` +
+            `The following is the user request translated into a JSON object with 2 spaces of indentation and no properties with the value undefined:\n`
+        );
     }
 }
 

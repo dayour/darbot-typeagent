@@ -67,7 +67,7 @@ class SessionNewCommandHandler implements CommandHandler {
             ),
         );
 
-        context.sessionContext.agentContext.chatHistory.entries.length = 0;
+        context.sessionContext.agentContext.chatHistory.clear();
 
         displaySuccess(
             `New session created${
@@ -100,6 +100,7 @@ class SessionOpenCommandHandler implements CommandHandler {
         const session = await Session.load(
             systemContext.persistDir,
             params.args.session,
+            systemContext.indexingServiceRegistry,
         );
         await setSessionOnCommandHandlerContext(systemContext, session);
         displaySuccess(`Session opened: ${params.args.session}`, context);

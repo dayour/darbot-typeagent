@@ -8,15 +8,11 @@ import {
     fromJsonActions,
 } from "../explanation/requestAction.js";
 import { MatchConfig, matchParts } from "./constructionMatch.js";
-import {
-    ParsePart,
-    ParsePartJSON,
-    createParsePartFromJSON,
-} from "./parsePart.js";
+import { ParsePart, createParsePartFromJSON } from "./parsePart.js";
 import {
     MatchPart,
-    MatchPartJSON,
     MatchSet,
+    toTransformInfoKey,
     TransformInfo,
 } from "./matchPart.js";
 import { Transforms } from "./transforms.js";
@@ -25,26 +21,39 @@ import {
     createActionProps,
     matchedValues,
 } from "./constructionValue.js";
+import {
+    ConstructionJSON,
+    ConstructionPartJSON,
+    ParsePartJSON,
+} from "./constructionJSONTypes.js";
 
-type ImplicitParameter = {
+export type ImplicitParameter = {
     paramName: string;
     paramValue: ParamValueType;
 };
 
+// Whether a construction part allow wildcard match.
 export const enum WildcardMode {
     Disabled = 0,
-    Enabled = 1,
-    Checked = 2,
+    Enabled = 1, // disallow reference if config to reject references.
+    Checked = 2, // always allow reference in wildcard regardless of config.
+    Entity = 3, // allow entity wildcard match.
 }
 
 export type ConstructionPart = {
     readonly wildcardMode: WildcardMode;
     readonly capture: boolean;
-    readonly regExp: RegExp;
+    readonly regExp: RegExp | undefined; // wildcard may not have regExp
     readonly optional: boolean;
     equals(other: ConstructionPart): boolean;
 
     toString(verbose?: boolean): string;
+
+    // For partial match, return completion value for this part.
+    getCompletion(): Iterable<string> | undefined;
+
+    // For partial match, return the property name for this part.
+    getPropertyNames(): string[] | undefined;
 };
 
 function getDefaultTranslator(transformNamespaces: Map<string, Transforms>) {
@@ -126,6 +135,7 @@ export class Construction {
         const actionProps = createActionProps(
             matchedValues.values,
             this.emptyArrayParameters,
+            config.partial,
         );
         return [
             {
@@ -136,9 +146,12 @@ export class Construction {
                     config.history,
                 ),
                 conflictValues: matchedValues.conflictValues,
+                entityWildcardPropertyNames:
+                    matchedValues.entityWildcardPropertyNames,
                 matchedCount: matchedValues.matchedCount,
                 wildcardCharCount: matchedValues.wildcardCharCount,
                 nonOptionalCount: this.parts.filter((p) => !p.optional).length,
+                partialPartCount: matchedValues.partialPartCount,
             },
         ];
     }
@@ -250,22 +263,44 @@ export class Construction {
         transformNamespaces: Map<string, Transforms>,
         index: number,
     ) {
+        const partCounts = new Map<string, number>();
+        for (const part of construction.parts) {
+            if (isParsePartJSON(part)) {
+                continue;
+            }
+            const transformInfos = part.transformInfos;
+            if (transformInfos === undefined) {
+                continue;
+            }
+            for (const info of transformInfos) {
+                const key = toTransformInfoKey(info);
+                partCounts.set(key, (partCounts.get(key) ?? 0) + 1);
+            }
+        }
+
         return new Construction(
             construction.parts.map((part) => {
                 if (isParsePartJSON(part)) {
                     return createParsePartFromJSON(part);
                 }
-                const matchSet = allMatchSets.get(part.matchSet);
-                if (matchSet === undefined) {
-                    throw new Error(
-                        `Unable to resolve MatchSet ${part.matchSet}`,
-                    );
+                let matchSet: MatchSet | undefined = undefined;
+                if (part.matchSet) {
+                    matchSet = allMatchSets.get(part.matchSet);
+                    if (matchSet === undefined) {
+                        throw new Error(
+                            `Unable to resolve MatchSet ${part.matchSet}`,
+                        );
+                    }
                 }
+                const transformInfos = part.transformInfos?.map((info) => ({
+                    ...info,
+                    partCount: partCounts.get(toTransformInfoKey(info))!,
+                }));
                 return new MatchPart(
                     matchSet,
                     part.optional ?? false,
                     part.wildcardMode ?? WildcardMode.Disabled,
-                    part.transformInfos,
+                    transformInfos,
                 );
             }),
             transformNamespaces,
@@ -288,18 +323,9 @@ export class Construction {
     }
 }
 
-type ConstructionPartJSON = MatchPartJSON | ParsePartJSON;
-
 function isParsePartJSON(part: ConstructionPartJSON): part is ParsePartJSON {
     return (part as any).parserName !== undefined;
 }
-
-export type ConstructionJSON = {
-    parts: ConstructionPartJSON[];
-    emptyArrayParameters?: string[];
-    implicitParameters?: ImplicitParameter[];
-    implicitActionName?: string;
-};
 
 export type MatchResult = {
     construction: Construction;
@@ -307,22 +333,7 @@ export type MatchResult = {
     matchedCount: number;
     wildcardCharCount: number;
     nonOptionalCount: number;
+    entityWildcardPropertyNames: string[];
     conflictValues?: [string, ParamValueType[]][] | undefined;
+    partialPartCount?: number | undefined; // Only used for partial match
 };
-
-export function convertConstructionV2ToV3(
-    constructions: ConstructionJSON[],
-    matchSetToTransformInfo: Map<string, TransformInfo[]>,
-) {
-    for (const construction of constructions) {
-        construction.parts.forEach((part) => {
-            if (isParsePartJSON(part)) {
-                throw new Error("ParsePart is not supported in V2");
-            }
-            const transformInfos = matchSetToTransformInfo.get(part.matchSet);
-            if (transformInfos) {
-                part.transformInfos = transformInfos;
-            }
-        });
-    }
-}

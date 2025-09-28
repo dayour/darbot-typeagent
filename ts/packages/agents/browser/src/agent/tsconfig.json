@@ -1,14 +1,13 @@
 {
-    "extends": "../../../../../tsconfig.base.json",
-    "compilerOptions": {
-      "composite": true,
-      "rootDir": ".",
-      "outDir": "../../dist/agent",
-      "types": ["node"],
-    },
-    "include":["./**/*"],
-    "references": [
-      { "path": "../common" }
-    ]
-  }
-  
+  "extends": "../../../../../tsconfig.base.json",
+  "compilerOptions": {
+    "composite": true,
+    "incremental": true,
+    "rootDir": ".",
+    "outDir": "../../dist/agent",
+    "types": ["node"]
+  },
+  "include": ["./**/*", "../common/searchProvider.mts"],
+  "exclude": ["./backup/**/*"],
+  "references": [{ "path": "../common" }]
+}

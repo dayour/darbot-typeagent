@@ -12,9 +12,10 @@ import {
     AppAgentEvent,
     DynamicDisplay,
     TypeAgentAction,
+    ResolveEntityResult,
 } from "@typeagent/agent-sdk";
 import { createActionResultFromError } from "@typeagent/agent-sdk/helpers/action";
-import { searchAlbum, searchTracks } from "../client.js";
+import { searchTracks } from "../client.js";
 import { htmlStatus } from "../playback.js";
 import { getPlayerCommandInterface } from "./playerCommands.js";
 import {
@@ -22,9 +23,17 @@ import {
     searchArtists,
     SpotifyQuery,
     toQueryString,
+    searchAlbums,
 } from "../search.js";
-import { PlayerAction } from "./playerSchema.js";
+import { PlayerActions } from "./playerSchema.js";
 import registerDebug from "debug";
+import { resolveMusicDeviceEntity } from "../devices.js";
+import { getUserDevices } from "../endpoints.js";
+import {
+    addUserDataStrings,
+    getPlaylistsFromUserData,
+    getUserDataCompletions,
+} from "../userData.js";
 
 const debugSpotify = registerDebug("typeagent:spotify");
 
@@ -34,6 +43,7 @@ export function instantiate(): AppAgent {
         updateAgentContext: updatePlayerContext,
         executeAction: executePlayerAction,
         validateWildcardMatch: validatePlayerWildcardMatch,
+        resolveEntity: resolvePlayerEntity,
         getDynamicDisplay: getPlayerDynamicDisplay,
         ...getPlayerCommandInterface(),
         getActionCompletion: getPlayerActionCompletion,
@@ -51,14 +61,16 @@ async function initializePlayerContext() {
 }
 
 async function executePlayerAction(
-    action: TypeAgentAction<PlayerAction>,
+    action: TypeAgentAction<PlayerActions>,
     context: ActionContext<PlayerActionContext>,
 ) {
-    if (context.sessionContext.agentContext.spotify) {
+    const clientContext = context.sessionContext.agentContext.spotify;
+    if (clientContext) {
         return handleCall(
             action,
-            context.sessionContext.agentContext.spotify,
+            clientContext,
             context.actionIO,
+            context.sessionContext.instanceStorage,
         );
     }
 
@@ -120,7 +132,7 @@ export async function disableSpotify(
 }
 
 async function validatePlayerWildcardMatch(
-    action: PlayerAction,
+    action: PlayerActions,
     context: SessionContext<PlayerActionContext>,
 ) {
     const clientContext = context.agentContext.spotify;
@@ -154,12 +166,40 @@ async function validatePlayerWildcardMatch(
     return true;
 }
 
+async function resolvePlayerEntity(
+    type: string,
+    name: string,
+    context: SessionContext<PlayerActionContext>,
+): Promise<ResolveEntityResult | undefined> {
+    const clientContext = context.agentContext.spotify;
+    if (clientContext === undefined) {
+        return undefined;
+    }
+    switch (type) {
+        case "MusicDevice":
+            return resolveMusicDeviceEntity(clientContext, name);
+    }
+    return undefined;
+}
+
 async function validateTrack(
     trackName: string,
     artists: string[] | undefined,
     album: string | undefined,
     context: IClientContext,
 ) {
+    if (artists === undefined && album === undefined) {
+        const data = context.userData?.data;
+        if (data && data.tracks) {
+            if (data.nameMap === undefined) {
+                addUserDataStrings(data);
+            }
+            // if user data has exact match return true
+            if (data.nameMap!.get(trackName.toLocaleLowerCase())) {
+                return true;
+            }
+        }
+    }
     const resolvedArtists = artists
         ? await resolveArtists(artists, context)
         : [];
@@ -203,9 +243,18 @@ async function validateAlbum(
     if (resolvedArtists === undefined) {
         return false;
     }
-    // search album already return exact matches.
-    const album = await searchAlbum(albumName, context);
-    if (album === undefined) {
+    const albums = await searchAlbums(albumName, undefined, context);
+    if (albums === undefined) {
+        return false;
+    }
+
+    const lowerCaseAlbumName = albumName.toLowerCase();
+    // For validation for wildcard match, only allow substring match.
+    const filteredAlbums = albums.filter((album) =>
+        album.name.toLowerCase().includes(lowerCaseAlbumName),
+    );
+
+    if (filteredAlbums.length === 0) {
         return false;
     }
 
@@ -214,11 +263,27 @@ async function validateAlbum(
     }
 
     return resolvedArtists.every((resolvedArtist) =>
-        album.artists.some((artists) => artists.id === resolvedArtist.id),
+        filteredAlbums.some((album) =>
+            album.artists.some((artists) => artists.id === resolvedArtist.id),
+        ),
     );
 }
 
 async function validateArtist(artistName: string, context: IClientContext) {
+    // if user data has exact match return true
+    const userData = context.userData;
+    if (userData && userData.data) {
+        const artists = userData.data.artists;
+        if (artists) {
+            if (!userData.data.nameMap) {
+                addUserDataStrings(userData.data);
+            }
+            if (userData.data.nameMap!.get(artistName.toLocaleLowerCase())) {
+                return true;
+            }
+        }
+    }
+
     const data = await searchArtists(artistName, context);
 
     if (data && data.artists && data.artists.items.length > 0) {
@@ -246,7 +311,7 @@ async function getPlayerDynamicDisplay(
         const status = await htmlStatus(context.agentContext.spotify);
         return {
             content:
-                type === "html" ? status.displayContent : status.literalText!,
+                type === "html" ? status.displayContent : status.historyText!,
 
             nextRefreshMs: 1000,
         };
@@ -255,17 +320,31 @@ async function getPlayerDynamicDisplay(
 }
 
 async function getPlayerActionCompletion(
+    context: SessionContext<PlayerActionContext>,
     action: AppAction,
     propertyName: string,
-    context: SessionContext<PlayerActionContext>,
+    entityType?: string,
 ): Promise<string[]> {
+    const result: string[] = [];
     const clientContext = context.agentContext.spotify;
     if (clientContext === undefined) {
-        return [];
+        return result;
     }
+
+    if (entityType === "MusicDevice") {
+        const devices = await getUserDevices(clientContext.service);
+        if (devices !== undefined) {
+            result.push(
+                ...devices.devices
+                    .filter((device) => device.id !== null)
+                    .map((device) => device.name),
+            );
+        }
+    }
+
     const userData = clientContext.userData;
     if (userData === undefined) {
-        return [];
+        return result;
     }
 
     let track = false;
@@ -295,23 +374,25 @@ async function getPlayerActionCompletion(
             break;
         case "playGenre":
             break;
+        case "getPlaylist":
+        case "deletePlaylist":
+            if (propertyName === "parameters.name") {
+                if (userData.data.playlists === undefined) {
+                    await getPlaylistsFromUserData(
+                        clientContext.service,
+                        userData.data,
+                    );
+                }
+                if (userData.data.playlists) {
+                    const names = userData.data.playlists
+                        .map((pl) => pl.name)
+                        .sort();
+                    result.push(...names);
+                }
+            }
+            return result;
     }
 
-    const result: string[] = [];
-    if (track) {
-        for (const track of userData.data.tracks.values()) {
-            result.push(track.name);
-        }
-    }
-    if (album) {
-        for (const album of userData.data.albums.values()) {
-            result.push(album.name);
-        }
-    }
-    if (artist) {
-        for (const artist of userData.data.artists.values()) {
-            result.push(artist.name);
-        }
-    }
+    result.push(...getUserDataCompletions(userData.data, track, artist, album));
     return result;
 }

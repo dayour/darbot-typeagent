@@ -47,20 +47,29 @@ export type CommandDescriptors =
     | CommandDescriptorTable; // multiple commands
 
 //===========================================
-// API exposed APIs
+// Command APIs
 //===========================================
+export type CompletionGroup = {
+    name: string; // The group name for the completion
+    completions: string[]; // The list of completions in the group
+    needQuotes?: boolean; // If true, the completion should be quoted if it has spaces.
+    emojiChar?: string | undefined; // Optional icon for the completion category
+    sorted?: boolean; // If true, the completions are already sorted. Default is false, and the completions sorted alphabetically.
+};
+
 export interface AppAgentCommandInterface {
     // Get the command descriptors
     getCommands(context: SessionContext): Promise<CommandDescriptors>;
 
+    // Provide completion for a partial command
     getCommandCompletion?(
         commands: string[], // path to the command descriptors
         params: ParsedCommandParams<ParameterDefinitions> | undefined,
-        names: string[], // array of <argName> or --<flagName> or --<jsonFlagName>.
+        names: string[], // array of <argName> or --<flagName> or --<jsonFlagName> for completion
         context: SessionContext<unknown>,
-    ): Promise<string[]>;
+    ): Promise<CompletionGroup[]>;
 
-    // Execute a resolved command
+    // Execute a resolved command.  Exception from the execution are treated as errors and displayed to the user.
     executeCommand(
         commands: string[], // path to the command descriptors
         params: ParsedCommandParams<ParameterDefinitions> | undefined,

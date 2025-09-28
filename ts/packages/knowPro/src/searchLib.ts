@@ -7,11 +7,14 @@
  */
 
 import {
+    ISemanticRefCollection,
     KnowledgePropertyName,
     PropertySearchTerm,
+    ScoredSemanticRefOrdinal,
     SearchTerm,
     SearchTermGroup,
     SearchTermGroupTypes,
+    SemanticRef,
 } from "./interfaces.js";
 import * as kpLib from "knowledge-processor";
 import { PropertyNames } from "./propertyIndex.js";
@@ -171,14 +174,99 @@ export function createPropertySearchTerms(
     return propertySearchTerms;
 }
 
-export function createTagSearchTermGroup(tags: string[]): SearchTermGroup {
+export function createTopicSearchTermGroup(
+    topicTerms: string | string[],
+    exactMatch: boolean = false,
+): SearchTermGroup {
     const termGroup = createOrMaxTermGroup();
-    for (const tag of tags) {
+    if (typeof topicTerms === "string") {
         termGroup.terms.push(
-            createPropertySearchTerm(PropertyNames.Tag, tag, true),
+            createPropertySearchTerm(
+                PropertyNames.Topic,
+                topicTerms,
+                exactMatch,
+            ),
+        );
+    } else {
+        for (const term of topicTerms) {
+            termGroup.terms.push(
+                createPropertySearchTerm(PropertyNames.Topic, term, exactMatch),
+            );
+        }
+    }
+    return termGroup;
+}
+
+export function createEntitySearchTermGroup(
+    name: string | undefined,
+    type?: string | undefined,
+    faceName?: string | undefined,
+    facetValue?: string | undefined,
+    exactMatch: boolean = false,
+): SearchTermGroup {
+    const termGroup = createOrMaxTermGroup();
+    if (name) {
+        termGroup.terms.push(
+            createPropertySearchTerm(
+                PropertyNames.EntityName,
+                name,
+                exactMatch,
+            ),
+        );
+    }
+    if (type) {
+        termGroup.terms.push(
+            createPropertySearchTerm(
+                PropertyNames.EntityType,
+                type,
+                exactMatch,
+            ),
+        );
+    }
+    if (faceName) {
+        termGroup.terms.push(
+            createPropertySearchTerm(
+                PropertyNames.FacetName,
+                faceName,
+                exactMatch,
+            ),
+        );
+    }
+    if (facetValue) {
+        termGroup.terms.push(
+            createPropertySearchTerm(
+                PropertyNames.FacetValue,
+                facetValue,
+                exactMatch,
+            ),
         );
     }
     return termGroup;
+}
+
+export function createTagSearchTermGroup(
+    tags: string[],
+    exactMatch: boolean = true,
+): SearchTermGroup {
+    const termGroup = createOrMaxTermGroup();
+    for (const tag of tags) {
+        termGroup.terms.push(
+            createPropertySearchTerm(PropertyNames.Tag, tag, exactMatch),
+        );
+    }
+    return termGroup;
+}
+
+export function isPropertyTerm(
+    term: SearchTerm | PropertySearchTerm | SearchTermGroup,
+): term is PropertySearchTerm {
+    return term.hasOwnProperty("propertyName");
+}
+
+export function isSearchGroupTerm(
+    term: SearchTerm | PropertySearchTerm | SearchTermGroup,
+): term is SearchTermGroup {
+    return term.hasOwnProperty("booleanOp");
 }
 
 function splitTermValues(term: string, splitChar: string): string[] {
@@ -196,14 +284,22 @@ export function createMultipleChoiceQuestion(
 ): string {
     let text = question;
     if (choices.length > 0) {
-        text = `Multiple choice question:\n${question}`;
-        text += "\nAnswer using the following choices *only*:\n";
+        text = `Multiple choice question:\n${question}\n`;
+        text += "Answer using *one or more* of the following choices *only*:\n";
         for (let i = 0; i < choices.length; ++i) {
             text += `- ${choices[i].trim()}\n`;
         }
         if (addNone) {
-            text += "- None of the above";
+            text += "- None of the above\n";
         }
     }
     return text;
+}
+
+export function getSemanticRefsFromScoredOrdinals(
+    semanticRefs: ISemanticRefCollection,
+    scoredOrdinals: ScoredSemanticRefOrdinal[],
+): SemanticRef[] {
+    const ordinals = scoredOrdinals.map((sr) => sr.semanticRefOrdinal);
+    return semanticRefs.getMultiple(ordinals);
 }

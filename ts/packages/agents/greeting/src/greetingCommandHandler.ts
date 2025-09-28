@@ -17,11 +17,7 @@ import {
 } from "@typeagent/agent-sdk/helpers/command";
 import { ChatModelWithStreaming, CompletionSettings, openai } from "aiclient";
 import { PromptSection, Result } from "typechat";
-import {
-    displayError,
-    displayResult,
-    displayStatus,
-} from "@typeagent/agent-sdk/helpers/display";
+import { displayError } from "@typeagent/agent-sdk/helpers/display";
 import {
     GreetingAction,
     PersonalizedGreetingAction,
@@ -131,7 +127,14 @@ export class GreetingCommandHandler implements CommandHandlerNoParams {
      */
     public async run(context: ActionContext<GreetingAgentContext>) {
         // Initial output to let the user know the agent is thinking...
-        displayStatus("...", context);
+        context.actionIO.appendDisplay(
+            {
+                type: "html",
+                content: `<div><style>.wait-dot{display: inline-block;animation: bounce 1.2s infinite;} .wait-dot.one{animation-delay: 0s;} .wait-dot.two{animation-delay: 0.2s;} .wait-dot.three {animation-delay: 0.4s;} @keyframes bounce {0%, 80%, 100% {transform: translateY(0);}40% {transform: translateY(-6px);}}</style><span class="wait-dot one">.</span><span class="wait-dot two">.</span><span class="wait-dot three">.</span></div>`,
+                kind: "status",
+            },
+            "temporary",
+        );
 
         // wait until we have the user's name
         if (context.sessionContext.agentContext.userPromise) {
@@ -153,7 +156,10 @@ export class GreetingCommandHandler implements CommandHandlerNoParams {
                         context,
                     )) as ActionResultSuccess;
 
-                    displayResult(result.literalText!, context);
+                    context.actionIO.appendDisplay(
+                        result.displayContent,
+                        "block",
+                    );
                     break;
 
                 // case "contextualGreetingAction":
@@ -344,7 +350,7 @@ async function getRecentChatHistory(
     const chatHistory: string[] = [];
 
     if (conversationManager !== undefined) {
-        let searchResponse = await conversationManager.getSearchResponse(
+        const searchResponse = await conversationManager.getSearchResponse(
             "What were we talking about most recently?",
             [{ terms: ["last conversation", "project"] }],
             { maxMatches: 5 },
@@ -378,32 +384,24 @@ async function getRecentChatHistory(
                 chatHistory.push(`- \"${msg.value.value}\"`);
             });
 
-            chatHistory.push("###");
-            if (
-                context.sessionContext.agentContext.user.givenName &&
-                context.sessionContext.agentContext.user.givenName.length > 0
-            ) {
-                chatHistory.push(
-                    `The user's given name is '${context.sessionContext.agentContext.user.givenName}'.`,
-                );
+            if (debug.enabled) {
+                const matches =
+                    await conversationManager.generateAnswerForSearchResponse(
+                        "What were we talking about last?",
+                        searchResponse,
+                    );
+                debug(matches);
             }
-            if (
-                context.sessionContext.agentContext.user.surName &&
-                context.sessionContext.agentContext.user.surName.length > 0
-            ) {
-                chatHistory.push(
-                    `The user's sur name is '${context.sessionContext.agentContext.user.surName}'.`,
-                );
-            }
-
-            const matches =
-                await conversationManager.generateAnswerForSearchResponse(
-                    "What were we talking about last?",
-                    searchResponse,
-                );
-            debug(matches);
         }
     }
 
+    chatHistory.push("###");
+    const user = context.sessionContext.agentContext.user;
+    if (user.givenName) {
+        chatHistory.push(`The user's given name is '${user.givenName}'.`);
+    }
+    if (user.surName) {
+        chatHistory.push(`The user's sur name is '${user.surName}'.`);
+    }
     return chatHistory;
 }

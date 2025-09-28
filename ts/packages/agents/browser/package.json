@@ -12,24 +12,40 @@
   "license": "MIT",
   "author": "Microsoft",
   "sideEffects": false,
+  "type": "module",
   "exports": {
     "./agent/manifest": "./src/agent/manifest.json",
-    "./agent/handlers": "./dist/agent/actionHandler.mjs"
+    "./agent/handlers": "./dist/agent/actionHandler.mjs",
+    "./agent/types": "./dist/common/browserControl.mjs",
+    "./agent/indexing": "./dist/agent/indexing/browserIndexingService.js",
+    "./contentScriptRpc/types": "./dist/common/contentScriptRpc/types.mjs",
+    "./contentScriptRpc/client": "./dist/common/contentScriptRpc/client.mjs"
   },
   "main": "index.js",
   "scripts": {
-    "build": "npm run tsc:common && concurrently npm:tsc:agent npm:tsc:puppeteer npm:vite",
-    "build:dev": "npm run tsc:common && concurrently npm:tsc:agent npm:tsc:puppeteer npm:vite:dev",
-    "clean": "rimraf dist deploy",
+    "build": "fluid-build . -t build",
+    "build:dev": "fluid-build . -t build:dev",
+    "build:extension": "fluid-build . -t build:extension",
+    "build:views": "fluid-build . -t build:views",
+    "clean": "rimraf dist deploy && rimraf -g **/*.tsbuildinfo *.done.build.log",
+    "dev:client": "vite serve",
     "package": "node scripts/packExtension.mjs",
+    "prepare": "node ./scripts/prepare.mjs .",
     "prettier": "prettier --check . --ignore-path ../../../.prettierignore",
     "prettier:fix": "prettier --write . --ignore-path ../../../.prettierignore",
-    "test": "jest",
+    "test": "npm run test:local",
+    "test:local": "jest",
     "tsc:agent": "tsc -p src/agent/tsconfig.json",
     "tsc:common": "tsc -p src/common/tsconfig.json",
+    "tsc:extension:chrome:typecheck": "tsc -p src/extension/tsconfig.json",
+    "tsc:extension:electron:typecheck": "tsc -p src/electron/tsconfig.json",
     "tsc:puppeteer": "tsc -p src/puppeteer/tsconfig.json",
-    "vite": "node scripts/buildExtension.mjs",
-    "vite:dev": "node scripts/buildExtension.mjs --dev"
+    "tsc:views:client:typecheck": "tsc -p src/views/client/plans/tsconfig.json",
+    "tsc:views:server": "tsc -p src/views/server/tsconfig.json",
+    "tsc:views:shared": "tsc -p src/views/shared/tsconfig.json",
+    "vite:extension": "build-extension",
+    "vite:extension:dev": "build-extension --dev",
+    "vite:views:client": "vite build"
   },
   "dependencies": {
     "@mozilla/readability": "^0.6.0",
@@ -37,29 +53,46 @@
     "action-schema": "workspace:*",
     "agent-rpc": "workspace:*",
     "aiclient": "workspace:*",
+    "azure-ai-foundry": "workspace:*",
     "bootstrap": "^5.3.3",
     "chalk": "^5.4.1",
+    "cheerio": "^1.1.0",
     "common-utils": "workspace:*",
+    "conversation-memory": "workspace:*",
+    "cytoscape": "^3.32.0",
+    "cytoscape-dagre": "^2.5.0",
+    "dagre": "^0.8.5",
     "debug": "^4.4.0",
     "dompurify": "^3.2.5",
+    "express": "^4.18.2",
+    "express-rate-limit": "^7.5.0",
     "html-to-text": "^9.0.5",
+    "jsdom": "^26.1.0",
     "jsonpath": "^1.1.1",
+    "knowledge-processor": "workspace:*",
+    "knowpro": "workspace:*",
+    "pdfjs-dist": "^5.3.31",
     "prismjs": "^1.30.0",
     "puppeteer": "^23.8.0",
     "puppeteer-extra": "^3.3.6",
     "puppeteer-extra-plugin-adblocker": "^2.13.6",
     "puppeteer-extra-plugin-stealth": "^2.11.2",
     "readline": "^1.3.0",
+    "sanitize-filename": "^1.6.3",
     "typeagent": "workspace:*",
     "typechat": "^0.1.1",
+    "website-memory": "workspace:*",
     "ws": "^8.17.1"
   },
   "devDependencies": {
-    "@crxjs/vite-plugin": "^2.0.0-beta.18",
     "@esbuild-plugins/node-globals-polyfill": "^0.2.3",
-    "@rollup/plugin-typescript": "^11.1.5",
+    "@fluidframework/build-tools": "^0.57.0",
     "@types/chrome": "^0.0.256",
+    "@types/cytoscape": "^3.21.9",
+    "@types/cytoscape-dagre": "^2.3.3",
+    "@types/dagre": "^0.7.52",
     "@types/debug": "^4.1.12",
+    "@types/express": "^4.17.21",
     "@types/html-to-text": "^9.0.4",
     "@types/jest": "^29.5.7",
     "@types/jquery": "^3.5.14",
@@ -83,6 +116,94 @@
     "ts-jest": "^29.3.2",
     "ts-loader": "^9.5.1",
     "typescript": "~5.4.5",
-    "vite": "^6.3.4"
+    "vite": "^6.3.6"
+  },
+  "fluidBuild": {
+    "tasks": {
+      "build": {
+        "dependsOn": [
+          "^build",
+          "build:extension",
+          "build:views",
+          "tsc:agent",
+          "tsc:puppeteer"
+        ],
+        "script": false
+      },
+      "build:dev": {
+        "dependsOn": [
+          "^build",
+          "build:extension:dev",
+          "build:views",
+          "tsc:agent",
+          "tsc:puppeteer"
+        ],
+        "script": false
+      },
+      "build:extension": {
+        "dependsOn": [
+          "tsc:extension:electron:typecheck",
+          "tsc:extension:chrome:typecheck",
+          "vite:extension"
+        ],
+        "script": false
+      },
+      "build:extension:dev": {
+        "dependsOn": [
+          "tsc:extension:electron:typecheck",
+          "tsc:extension:chrome:typecheck",
+          "vite:extension:dev"
+        ],
+        "script": false
+      },
+      "tsc:agent": [
+        "tsc:common"
+      ],
+      "vite:extension": [
+        "tsc:common"
+      ],
+      "vite:extension:dev": [
+        "tsc:common"
+      ],
+      "build:views": {
+        "dependsOn": [
+          "tsc:views:server",
+          "tsc:views:client:typecheck",
+          "vite:views:client"
+        ],
+        "script": false
+      },
+      "tsc:views:server": [
+        "tsc:views:shared"
+      ],
+      "tsc:views:client:typecheck": [
+        "tsc:views:shared"
+      ],
+      "vite:views:client": {
+        "dependsOn": [
+          "tsc:views:shared"
+        ],
+        "files": {
+          "inputGlobs": [
+            "src/views/client/**/*"
+          ],
+          "outputGlobs": [
+            "dist/views/public/**/*"
+          ]
+        }
+      }
+    },
+    "declarativeTasks": {
+      "build-extension": {
+        "inputGlobs": [
+          "src/extension/**",
+          "src/electron/**"
+        ],
+        "outputGlobs": [
+          "dist/extension/**",
+          "dist/electron/**"
+        ]
+      }
+    }
   }
 }

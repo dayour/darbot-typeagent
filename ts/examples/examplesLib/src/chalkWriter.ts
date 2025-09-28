@@ -9,7 +9,8 @@ import {
     StopWatch,
 } from "interactive-app";
 import chalk, { ChalkInstance } from "chalk";
-import { Result } from "typechat";
+import { PromptSection, Result } from "typechat";
+import { openai } from "aiclient";
 
 export type ChalkColor = {
     foreColor?: ChalkInstance | undefined;
@@ -19,6 +20,7 @@ export type ChalkColor = {
 export class ChalkWriter extends ConsoleWriter {
     private _io: InteractiveIo;
     private _color: ChalkColor;
+    private _colorStack: ChalkInstance[];
 
     constructor(io?: InteractiveIo) {
         if (!io) {
@@ -27,6 +29,7 @@ export class ChalkWriter extends ConsoleWriter {
         super(io.stdout);
         this._io = io;
         this._color = {};
+        this._colorStack = [];
     }
 
     public get io(): InteractiveIo {
@@ -74,6 +77,20 @@ export class ChalkWriter extends ConsoleWriter {
         this.write(text, isStyled);
         this.write("\n");
         return this;
+    }
+
+    public writeLineInColor(
+        color: ChalkInstance,
+        text?: string,
+        isStyled: boolean = false,
+    ) {
+        const prevColor = this.setForeColor(color);
+        try {
+            this.write(text, isStyled);
+            this.write("\n");
+        } finally {
+            this.setForeColor(prevColor);
+        }
     }
 
     public writeLines(lines: string[]): ChalkWriter {
@@ -132,15 +149,21 @@ export class ChalkWriter extends ConsoleWriter {
         return this;
     }
 
-    public writeTiming(color: ChalkInstance, clock: StopWatch, label?: string) {
+    public writeTiming(
+        clock: StopWatch,
+        label?: string,
+        color?: ChalkInstance,
+    ) {
         const timing = label
             ? `${label}: ${clock.elapsedString()}`
             : clock.elapsedString();
-        this.writeInColor(color, timing);
+        this.writeInColor(color ?? chalk.gray, timing);
+        return this;
     }
 
     public writeError(message: string) {
         this.writeLine(chalk.redBright(message));
+        return this;
     }
 
     public writeListInColor(
@@ -154,10 +177,22 @@ export class ChalkWriter extends ConsoleWriter {
         } finally {
             this.setForeColor(prevColor);
         }
+        return this;
+    }
+
+    public writePromptSection(prompt: PromptSection) {
+        if (prompt.content) {
+            this.writeLine(`[Role: ${prompt.role}]`);
+            if (typeof prompt.content === "string") {
+                this.writeLine(prompt.content);
+            } else {
+                this.writeJson(prompt.content);
+            }
+        }
+        return this;
     }
 
     public writeTranslation<T>(result: Result<T>) {
-        this.writeLine();
         if (result.success) {
             this.writeJson(result.data);
         } else {
@@ -188,6 +223,30 @@ export class ChalkWriter extends ConsoleWriter {
         label = label ? label + " " : "";
         const text = `[${label}${curCount} / ${total}]`;
         this.writeInColor(chalk.gray, text);
+        return this;
+    }
+
+    public writeCompletionStats(stats: openai.CompletionUsageStats) {
+        this.writeInColor(chalk.gray, () => {
+            this.writeLine(`Prompt tokens: ${stats.prompt_tokens}`);
+            this.writeLine(`Completion tokens: ${stats.completion_tokens}`);
+            this.writeLine(`Total tokens: ${stats.total_tokens}`);
+        });
+        return this;
+    }
+
+    public pushColor(color: ChalkInstance) {
+        const prevColor = this.setForeColor(color);
+        if (prevColor) {
+            this._colorStack.push(prevColor);
+        }
+        return this;
+    }
+
+    public popColor() {
+        const color =
+            this._colorStack.length > 0 ? this._colorStack.pop() : undefined;
+        this.setForeColor(color);
         return this;
     }
 }

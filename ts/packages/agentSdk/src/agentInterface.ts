@@ -3,10 +3,30 @@
 
 import { AppAction, ActionResult, TypeAgentAction } from "./action.js";
 import { AppAgentCommandInterface } from "./command.js";
-import { ActionIO, DisplayType, DynamicDisplay } from "./display.js";
+import {
+    ActionIO,
+    DisplayType,
+    DynamicDisplay,
+    DisplayContent,
+} from "./display.js";
 import { Entity } from "./memory.js";
 import { Profiler } from "./profiler.js";
 import { TemplateSchema } from "./templateInput.js";
+
+//==============================================================================
+// Indexing Service Types
+//==============================================================================
+export type IndexingServiceConfig = {
+    serviceScript: string;
+    description?: string;
+};
+
+export type IndexingServicesManifest = Record<string, IndexingServiceConfig>;
+
+// if "separate", each activity is cache separately, or if "shared", it will share the cache with as if no activity is active.
+// If true, default to "separate".
+// If false, cache is disabled.
+export type ActivityCacheSpec = "separate" | "shared" | boolean;
 
 //==============================================================================
 // Manifest
@@ -17,6 +37,8 @@ export type AppAgentManifest = {
     commandDefaultEnabled?: boolean;
     localView?: boolean; // whether the agent serve a local view, default is false
     sharedLocalView?: string[]; // list of agents to share the local view with, default is none
+    indexingServices?: IndexingServicesManifest;
+    cachedActivities?: Record<string, ActivityCacheSpec>; // Key is activity name, default (if not specified) is false
 } & ActionManifest;
 
 export type SchemaTypeNames = {
@@ -51,6 +73,7 @@ export type ActionManifest = {
 
 export type AppAgentInitSettings = {
     localHostPort?: number; // the assigned port to use to serve the view if localHostPort is true in the manifest
+    options?: unknown; // additional options specific for the agent initialization
 };
 
 export type ResolveEntityResult = {
@@ -103,13 +126,14 @@ export interface AppAgent extends Partial<AppAgentCommandInterface> {
         data: unknown,
         propertyName: string,
         context: SessionContext,
-    ): Promise<string[]>;
-    // For action template
+    ): Promise<string[] | undefined>;
+    // For action completion (template, request/action command  completion)
     getActionCompletion?(
+        context: SessionContext,
         partialAction: AppAction, // action schemaName and actionName are validated by the dispatcher.
         propertyName: string,
-        context: SessionContext,
-    ): Promise<string[]>;
+        entityTypeName?: string, // the type of the entity if the property is an entity
+    ): Promise<string[] | undefined>;
     // Output
     getDynamicDisplay?(
         type: DisplayType,
@@ -126,6 +150,10 @@ export enum AppAgentEvent {
     Warning = "warning",
     Info = "info",
     Debug = "debug",
+
+    // Display-focused events
+    Toast = "toast",
+    Inline = "inline",
 }
 
 export interface SessionContext<T = unknown> {
@@ -133,7 +161,7 @@ export interface SessionContext<T = unknown> {
     readonly sessionStorage: Storage | undefined;
     readonly instanceStorage: Storage | undefined; // storage that are preserved across sessions
 
-    notify(event: AppAgentEvent, message: string): void;
+    notify(event: AppAgentEvent, message: string | DisplayContent): void;
 
     // choices default to ["Yes", "No"]
     popupQuestion(
@@ -158,7 +186,7 @@ export interface SessionContext<T = unknown> {
     getSharedLocalHostPort(agentName: string): Promise<number>;
 
     // Experimental: get the available indexes
-    indexes(type: "image" | "email" | "all"): Promise<any[]>;
+    indexes(type: "image" | "email" | "website" | "all"): Promise<any[]>;
 }
 
 // TODO: only utf8 & base64 is supported for now.
@@ -197,6 +225,8 @@ export type ActivityContext<T = Record<string, unknown>> = {
     description: string;
     state: T;
     openLocalView?: boolean | undefined;
+    activityEndAction?: AppAction | undefined;
+    restricted?: boolean | undefined; // restrict the actions to this specific agent, default is false
 };
 
 export interface ActionContext<T = void> {
@@ -205,4 +235,10 @@ export interface ActionContext<T = void> {
     readonly activityContext: ActivityContext | undefined;
     readonly actionIO: ActionIO;
     readonly sessionContext: SessionContext<T>;
+
+    // queue up toggle transient agent to be executed at the end of the commands
+    queueToggleTransientAgent(
+        agentName: string,
+        active: boolean,
+    ): Promise<void>;
 }

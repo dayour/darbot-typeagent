@@ -5,11 +5,10 @@ import chalk from "chalk";
 import {
     RequestAction,
     printProcessRequestActionResult,
-    HistoryContext,
     FullAction,
     ProcessRequestActionResult,
     ExplanationOptions,
-    equalNormalizedParamObject,
+    equalNormalizedObject,
     toFullActions,
 } from "agent-cache";
 
@@ -32,15 +31,24 @@ import {
 import registerDebug from "debug";
 import ExifReader from "exifreader";
 import { ProfileNames } from "../../../utils/profileNames.js";
-import { ActionContext, ParsedCommandParams } from "@typeagent/agent-sdk";
+import {
+    ActionContext,
+    ParsedCommandParams,
+    SessionContext,
+    CompletionGroup,
+} from "@typeagent/agent-sdk";
 import { CommandHandler } from "@typeagent/agent-sdk/helpers/command";
 import { DispatcherName, isUnknownAction } from "../dispatcherUtils.js";
+import { getTranslatorForSchema } from "../../../translation/translateRequest.js";
+import { getActivityNamespaceSuffix } from "../../../translation/matchRequest.js";
+import { addRequestToMemory, addResultToMemory } from "../../memory.js";
+import { requestCompletion } from "../../../translation/requestCompletion.js";
 import {
+    getCannotUseCacheReason,
     getHistoryContext,
-    getTranslatorForSchema,
-    translateRequest,
-} from "../../../translation/translateRequest.js";
-import { matchRequest } from "../../../translation/matchRequest.js";
+    interpretRequest,
+    InterpretResult,
+} from "../../../translation/interpretRequest.js";
 const debugExplain = registerDebug("typeagent:explain");
 
 async function canTranslateWithoutContext(
@@ -123,7 +131,7 @@ async function canTranslateWithoutContext(
             }
 
             if (
-                !equalNormalizedParamObject(
+                !equalNormalizedObject(
                     newAction.parameters,
                     oldAction.parameters,
                 )
@@ -150,26 +158,12 @@ async function canTranslateWithoutContext(
     }
 }
 
-function canBeCachedWithHistory(history?: HistoryContext) {
-    // TODO: Translation with additional instructions or activities context are not cacheable for now
-    return (
-        history === undefined ||
-        ((history.additionalInstructions === undefined ||
-            history.additionalInstructions.length === 0) &&
-            history.activityContext === undefined)
-    );
-}
-
 function getExplainerOptions(
     requestAction: RequestAction,
     context: CommandHandlerContext,
 ): ExplanationOptions | undefined {
     if (!context.session.explanation) {
         // Explanation is disabled
-        return undefined;
-    }
-
-    if (!canBeCachedWithHistory(requestAction.history)) {
         return undefined;
     }
 
@@ -183,6 +177,7 @@ function getExplainerOptions(
 
     const usedTranslators = new Map<string, TypeAgentTranslator>();
     const actions = requestAction.actions;
+    const activeSchemas = new Set(context.agents.getActiveSchemas());
     for (const { action } of actions) {
         if (isUnknownAction(action)) {
             // can't explain unknown actions
@@ -195,15 +190,20 @@ function getExplainerOptions(
             return undefined;
         }
 
+        // TODO: This does not support activities.
         usedTranslators.set(
             schemaName,
-            getTranslatorForSchema(context, schemaName),
+            getTranslatorForSchema(context, schemaName, activeSchemas),
         );
     }
     const { list, value, translate } =
         context.session.getConfig().explainer.filter.reference;
 
     return {
+        namespaceSuffix: getActivityNamespaceSuffix(
+            context,
+            requestAction.history?.activityContext,
+        ),
         checkExplainable: translate
             ? (requestAction: RequestAction) =>
                   canTranslateWithoutContext(
@@ -218,18 +218,16 @@ function getExplainerOptions(
 }
 
 async function requestExplain(
-    requestAction: RequestAction,
     context: CommandHandlerContext,
-    fromCache: boolean,
-    fromUser: boolean,
+    attachments: CachedImageWithDetails[] | undefined,
+    translationResult: InterpretResult,
 ) {
     // Make sure the current requestId is captured
     const requestId = context.requestId;
-    const notifyExplained = (result?: ProcessRequestActionResult) => {
-        const explanationResult = result?.explanationResult.explanation;
-        const error = explanationResult?.success
-            ? undefined
-            : explanationResult?.message;
+
+    const { fromCache, fromUser, requestAction } = translationResult;
+
+    const notifyExplained = (error?: string) => {
         context.clientIO.notify(
             "explained",
             requestId,
@@ -243,6 +241,22 @@ async function requestExplain(
         );
     };
 
+    const notifyExplainedResult = (result: ProcessRequestActionResult) => {
+        const explanationResult = result.explanationResult.explanation;
+        const error = explanationResult.success
+            ? undefined
+            : explanationResult?.message;
+        notifyExplained(error);
+    };
+
+    const cannotUseCacheReason = getCannotUseCacheReason(
+        context,
+        attachments,
+        requestAction.history,
+    );
+    if (cannotUseCacheReason !== undefined) {
+        notifyExplained(`cannot not use cache (${cannotUseCacheReason})`);
+    }
     if (fromCache && !fromUser) {
         // If it is from cache, and not from the user, explanation is not necessary.
         notifyExplained();
@@ -261,25 +275,15 @@ async function requestExplain(
     );
 
     if (context.explanationAsynchronousMode) {
-        processRequestActionP.then(notifyExplained).catch((e) =>
-            context.clientIO.notify(
-                "explained",
-                requestId,
-                {
-                    error: e.message,
-                    fromCache,
-                    fromUser,
-                    time: new Date().toLocaleTimeString(),
-                },
-                DispatcherName,
-            ),
-        );
+        processRequestActionP
+            .then(notifyExplainedResult)
+            .catch((e) => notifyExplained(e.message));
     } else {
         console.log(
             chalk.grey(`Generating explanation for '${requestAction}'`),
         );
         const processRequestActionResult = await processRequestActionP;
-        notifyExplained(processRequestActionResult);
+        notifyExplainedResult(processRequestActionResult);
 
         printProcessRequestActionResult(processRequestActionResult);
     }
@@ -337,48 +341,38 @@ export class RequestCommandHandler implements CommandHandler {
                 }
             }
 
-            const history = systemContext.session.getConfig().translation
-                .history.enabled
-                ? getHistoryContext(systemContext)
-                : undefined;
-
-            // prefetch entities here
-            systemContext.chatHistory.addUserEntry(
-                request,
-                systemContext.requestId,
-                cachedAttachments,
-            );
-
             // Make sure we clear any left over streaming context
             systemContext.streamingActionContext?.closeActionContext();
             systemContext.streamingActionContext = undefined;
 
-            const canUseCacheMatch =
-                (attachments === undefined || attachments.length === 0) &&
-                canBeCachedWithHistory(history);
-            const match = canUseCacheMatch
-                ? await matchRequest(request, context, history)
-                : undefined;
+            // Translate to action
 
-            const translationResult =
-                match === undefined // undefined means not found
-                    ? await translateRequest(
-                          request,
-                          context,
-                          history,
-                          cachedAttachments,
-                          0,
-                      )
-                    : match; // result or null
-
-            if (!translationResult) {
-                // undefined means not found or not translated
-                // null means cancelled because of replacement parse error.
-                return;
+            // Get the history context before adding the request to memory
+            const history = getHistoryContext(systemContext);
+            addRequestToMemory(systemContext, request, cachedAttachments);
+            let interpretResult: InterpretResult;
+            try {
+                interpretResult = await interpretRequest(
+                    context,
+                    request,
+                    cachedAttachments,
+                    history,
+                );
+            } catch (e: any) {
+                addResultToMemory(
+                    systemContext,
+                    `Error translating request '${request}': ${e.message}`,
+                    DispatcherName,
+                );
+                systemContext?.logger?.logEvent("request:exception", {
+                    request,
+                    message: e.message,
+                    stack: e.stack,
+                });
+                throw e;
             }
 
-            const { requestAction, fromUser, fromCache, tokenUsage } =
-                translationResult;
+            const { requestAction, tokenUsage } = interpretResult;
 
             if (tokenUsage) {
                 const commandResult = getCommandResult(systemContext);
@@ -387,32 +381,39 @@ export class RequestCommandHandler implements CommandHandler {
                 }
             }
 
-            if (
-                requestAction !== null &&
-                requestAction !== undefined &&
-                systemContext.conversationManager
-            ) {
-                systemContext.conversationManager.queueAddMessage({
-                    text: request,
-                    timestamp: new Date(),
-                });
-            }
-
+            // Execute the actions
             await executeActions(
                 requestAction.actions,
                 requestAction.history?.entities,
                 context,
             );
-            if (canUseCacheMatch) {
-                await requestExplain(
-                    requestAction,
-                    systemContext,
-                    fromCache,
-                    fromUser,
-                );
-            }
+
+            await requestExplain(
+                systemContext,
+                cachedAttachments,
+                interpretResult,
+            );
         } finally {
             profiler?.stop();
         }
+    }
+    public async getCompletion(
+        context: SessionContext<CommandHandlerContext>,
+        params: ParsedCommandParams<typeof this.parameters>,
+        names: string[],
+    ): Promise<CompletionGroup[]> {
+        const completions: CompletionGroup[] = [];
+        for (const name of names) {
+            if (name === "request") {
+                const requestPrefix = params.args.request;
+                completions.push(
+                    ...(await requestCompletion(
+                        requestPrefix,
+                        context.agentContext,
+                    )),
+                );
+            }
+        }
+        return completions;
     }
 }

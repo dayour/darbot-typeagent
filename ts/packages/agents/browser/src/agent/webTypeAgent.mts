@@ -10,7 +10,7 @@ import {
     GenericChannelProvider,
 } from "agent-rpc/channel";
 import { createRpc } from "agent-rpc/rpc";
-import { BrowserActionContext } from "./actionHandler.mjs";
+import { BrowserActionContext } from "./browserActions.mjs";
 import { WebAgentMessage } from "../common/webAgentMessageTypes.mjs";
 
 import registerDebug from "debug";
@@ -102,32 +102,38 @@ function ensureWebAgentChannels(context: SessionContext<BrowserActionContext>) {
         return existing;
     }
 
-    const webSocket = context.agentContext.webSocket;
-    if (webSocket === undefined) {
+    const agentServer = context.agentContext.agentWebSocketServer;
+    if (agentServer === undefined) {
         return undefined;
     }
 
     const channelProvider = createGenericChannelProvider((message) => {
-        webSocket.send(
-            JSON.stringify({
-                source: "dispatcher",
-                method: "webAgent/message",
-                params: message,
-            }),
-        );
+        const client = agentServer.getActiveClient();
+        if (client) {
+            client.socket.send(
+                JSON.stringify({
+                    source: "dispatcher",
+                    method: "webAgent/message",
+                    params: message,
+                }),
+            );
+        }
     });
 
     const registerChannel = createGenericChannel((message) => {
-        webSocket.send(
-            JSON.stringify({
-                source: "dispatcher",
-                method: "webAgent/register",
-                params: message,
-            }),
-        );
+        const client = agentServer.getActiveClient();
+        if (client) {
+            client.socket.send(
+                JSON.stringify({
+                    source: "dispatcher",
+                    method: "webAgent/register",
+                    params: message,
+                }),
+            );
+        }
     });
 
-    createRpc(registerChannel.channel, {
+    createRpc("webagent", registerChannel.channel, {
         addTypeAgent: async (param: {
             name: string;
             manifest: AppAgentManifest;

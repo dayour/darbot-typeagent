@@ -4,13 +4,12 @@
 import {
     getToggleCommandHandlers,
     getToggleHandlerTable,
-} from "../../../command/handlerUtils.js";
+} from "../../../helpers/command.js";
 import {
     CommandHandlerContext,
     changeContextConfig,
 } from "../../commandHandlerContext.js";
 import { getAppAgentName } from "../../../translation/agentTranslators.js";
-import { getServiceHostCommandHandlers } from "./serviceHost/serviceHostCommandHandler.js";
 
 import { simpleStarRegex } from "common-utils";
 import { openai as ai, getChatModelNames } from "aiclient";
@@ -18,6 +17,7 @@ import { SessionOptions } from "../../session.js";
 import chalk from "chalk";
 import {
     ActionContext,
+    CompletionGroup,
     ParameterDefinitions,
     ParsedCommandParams,
     PartialParsedCommandParams,
@@ -34,8 +34,7 @@ import {
 import { alwaysEnabledAgents } from "../../appAgentManager.js";
 import { getCacheFactory } from "../../../utils/cacheFactory.js";
 import { resolveCommand } from "../../../command/command.js";
-import child_process from "node:child_process";
-import { fileURLToPath } from "node:url";
+import { toggleActivityContext } from "../../../execute/activityContext.js";
 
 const enum AgentToggle {
     Schema,
@@ -50,11 +49,6 @@ const AgentToggleDescription = [
     "agent commands",
     "agents",
 ] as const;
-
-const penLauncherPath = new URL(
-    "../../../../../../../dotnet/penLauncher/bin/Debug/net9.0/penLauncher.exe",
-    import.meta.url,
-);
 
 function getAgentToggleOptions(
     toggle: AgentToggle,
@@ -276,7 +270,7 @@ function showAgentStatus(
     for (const [name, { schemas, actions, commands }] of entries) {
         const isAppAgentName = getAppAgentName(name) === name;
         const displayName = isAppAgentName ? name : `  ${name}`;
-        const emoji = isAppAgentName ? agents.getEmojis()[name] : "";
+        const emoji = isAppAgentName ? agents.getAppAgentEmoji(name) : "";
         table.push(getRow(emoji, displayName, schemas, actions, commands));
     }
 
@@ -429,7 +423,7 @@ class AgentToggleCommandHandler implements CommandHandler {
         params: PartialParsedCommandParams<typeof this.parameters>,
         names: string[],
     ) {
-        const completions: string[] = [];
+        const completions: CompletionGroup[] = [];
 
         for (const name of names) {
             if (name === "agentNames" || name === "--off") {
@@ -438,7 +432,10 @@ class AgentToggleCommandHandler implements CommandHandler {
                     this.toggle === AgentToggle.Agent
                         ? context.agentContext.agents.getAppAgentNames()
                         : context.agentContext.agents.getSchemaNames();
-                completions.push(...existingNames);
+                completions.push({
+                    name,
+                    completions: existingNames,
+                });
             }
         }
 
@@ -488,10 +485,13 @@ class ExplainerCommandHandler implements CommandHandler {
         params: PartialParsedCommandParams<typeof this.parameters>,
         names: string[],
     ) {
-        const completions: string[] = [];
+        const completions: CompletionGroup[] = [];
         for (const name of names) {
             if (name === "explainerName") {
-                completions.push(...getCacheFactory().getExplainerNames());
+                completions.push({
+                    name,
+                    completions: getCacheFactory().getExplainerNames(),
+                });
             }
         }
         return completions;
@@ -563,11 +563,18 @@ class ConfigModelSetCommandHandler implements CommandHandler {
         context: SessionContext<CommandHandlerContext>,
         params: PartialParsedCommandParams<ParameterDefinitions>,
         names: string[],
-    ): Promise<string[]> {
-        if (params.args?.model === undefined) {
-            return getChatModelNames();
+    ): Promise<CompletionGroup[]> {
+        const completions: CompletionGroup[] = [];
+        for (const name of names) {
+            if (name === "model") {
+                completions.push({
+                    name,
+                    completions: await getChatModelNames(),
+                });
+            }
         }
-        return [];
+
+        return completions;
     }
 }
 
@@ -619,16 +626,15 @@ class ConfigPortsCommandHandler implements CommandHandler {
     public async run(context: ActionContext<CommandHandler>) {
         const ports: string[][] = [["", "Agent", "Port"]];
         const cmdContext = context.sessionContext.agentContext as any;
-        const emojis: Record<string, string> = cmdContext.agents.getEmojis();
 
         cmdContext.agents.getAppAgentNames().forEach((name: string) => {
             const port = cmdContext.agents.getLocalHostPort(name);
 
             if (port !== undefined) {
                 ports.push([
-                    emojis[name],
+                    cmdContext.agents.getAppAgentEmoji(name),
                     name,
-                    cmdContext.agents.getLocalHostPort(name)!.toString(),
+                    port.toString(),
                 ]);
             }
         });
@@ -677,12 +683,15 @@ class FixedSchemaCommandHandler implements CommandHandler {
         context: SessionContext<CommandHandlerContext>,
         params: PartialParsedCommandParams<ParameterDefinitions>,
         names: string[],
-    ): Promise<string[]> {
-        const completions: string[] = [];
+    ): Promise<CompletionGroup[]> {
+        const completions: CompletionGroup[] = [];
         const systemContext = context.agentContext;
         for (const name of names) {
             if (name === "schemaName") {
-                return systemContext.agents.getActiveSchemas();
+                completions.push({
+                    name,
+                    completions: systemContext.agents.getActiveSchemas(),
+                });
             }
         }
         return completions;
@@ -1057,11 +1066,12 @@ class ConfigRequestCommandHandler implements CommandHandler {
         context: SessionContext<CommandHandlerContext>,
         params: PartialParsedCommandParams<ParameterDefinitions>,
         names: string[],
-    ): Promise<string[]> {
-        const completions: string[] = [];
+    ): Promise<CompletionGroup[]> {
+        const completions: CompletionGroup[] = [];
         const systemContext = context.agentContext;
         for (const name of names) {
             if (name === "appAgentName") {
+                const appAgentNames: string[] = [];
                 for (const appAgentName of systemContext.agents.getAppAgentNames()) {
                     if (
                         await checkRequestHandler(
@@ -1070,14 +1080,174 @@ class ConfigRequestCommandHandler implements CommandHandler {
                             false,
                         )
                     ) {
-                        completions.push(appAgentName);
+                        appAgentNames.push(appAgentName);
                     }
+                }
+                if (appAgentNames.length !== 0) {
+                    completions.push({
+                        name,
+                        completions: appAgentNames,
+                    });
                 }
             }
         }
         return completions;
     }
 }
+
+const configExplainerCommandHandlers: CommandHandlerTable = {
+    description: "Explainer configuration",
+    defaultSubCommand: "on",
+    commands: {
+        ...getToggleCommandHandlers("explanation", async (context, enable) => {
+            await changeContextConfig(
+                { explainer: { enabled: enable } },
+                context,
+            );
+        }),
+        async: getToggleHandlerTable(
+            "asynchronous explanation",
+            async (context, enable) => {
+                context.sessionContext.agentContext.explanationAsynchronousMode =
+                    enable;
+            },
+        ),
+        name: new ExplainerCommandHandler(),
+        model: new ConfigModelSetCommandHandler("explainer"),
+        filter: {
+            description: "Toggle explanation filter",
+            defaultSubCommand: "on",
+            commands: {
+                ...getToggleCommandHandlers(
+                    "all explanation filters",
+                    async (context, enable) => {
+                        await changeContextConfig(
+                            {
+                                explainer: {
+                                    filter: {
+                                        multiple: enable,
+                                        reference: {
+                                            value: enable,
+                                            list: enable,
+                                            translate: enable,
+                                        },
+                                    },
+                                },
+                            },
+                            context,
+                        );
+                    },
+                ),
+                multiple: getToggleHandlerTable(
+                    "explanation filter multiple actions",
+                    async (context, enable) => {
+                        await changeContextConfig(
+                            {
+                                explainer: {
+                                    filter: {
+                                        multiple: enable,
+                                    },
+                                },
+                            },
+                            context,
+                        );
+                    },
+                ),
+                reference: {
+                    description: "Toggle reference filter",
+                    defaultSubCommand: "on",
+                    commands: {
+                        ...getToggleCommandHandlers(
+                            "all explanation reference filters",
+                            async (context, enable) => {
+                                await changeContextConfig(
+                                    {
+                                        explainer: {
+                                            filter: {
+                                                reference: {
+                                                    value: enable,
+                                                    list: enable,
+                                                    translate: enable,
+                                                },
+                                            },
+                                        },
+                                    },
+                                    context,
+                                );
+                            },
+                        ),
+                        value: getToggleHandlerTable(
+                            "explainer filter reference by value in the request",
+                            async (context, enable) => {
+                                await changeContextConfig(
+                                    {
+                                        explainer: {
+                                            filter: {
+                                                reference: {
+                                                    value: enable,
+                                                },
+                                            },
+                                        },
+                                    },
+                                    context,
+                                );
+                            },
+                        ),
+                        list: getToggleHandlerTable(
+                            "explainer filter reference using word lists",
+                            async (context, enable) => {
+                                await changeContextConfig(
+                                    {
+                                        explainer: {
+                                            filter: {
+                                                reference: {
+                                                    list: enable,
+                                                },
+                                            },
+                                        },
+                                    },
+                                    context,
+                                );
+                            },
+                        ),
+                        translate: getToggleHandlerTable(
+                            "explainer filter reference by translate without context",
+                            async (context, enable) => {
+                                await changeContextConfig(
+                                    {
+                                        explainer: {
+                                            filter: {
+                                                reference: {
+                                                    translate: enable,
+                                                },
+                                            },
+                                        },
+                                    },
+                                    context,
+                                );
+                            },
+                        ),
+                    },
+                },
+            },
+        },
+    },
+};
+
+const configExecutionCommandHandlers: CommandHandlerTable = {
+    description: "Execution configuration",
+    commands: {
+        activity: getToggleHandlerTable(
+            "activity context",
+            async (context, enable) => {
+                toggleActivityContext(
+                    context.sessionContext.agentContext,
+                    enable,
+                );
+            },
+        ),
+    },
+};
 
 export function getConfigCommandHandlers(): CommandHandlerTable {
     return {
@@ -1089,150 +1259,8 @@ export function getConfigCommandHandlers(): CommandHandlerTable {
             agent: new AgentToggleCommandHandler(AgentToggle.Agent),
             request: new ConfigRequestCommandHandler(),
             translation: configTranslationCommandHandlers,
-            explainer: {
-                description: "Explainer configuration",
-                defaultSubCommand: "on",
-                commands: {
-                    ...getToggleCommandHandlers(
-                        "explanation",
-                        async (context, enable) => {
-                            await changeContextConfig(
-                                { explainer: { enabled: enable } },
-                                context,
-                            );
-                        },
-                    ),
-                    async: getToggleHandlerTable(
-                        "asynchronous explanation",
-                        async (context, enable) => {
-                            context.sessionContext.agentContext.explanationAsynchronousMode =
-                                enable;
-                        },
-                    ),
-                    name: new ExplainerCommandHandler(),
-                    model: new ConfigModelSetCommandHandler("explainer"),
-                    filter: {
-                        description: "Toggle explanation filter",
-                        defaultSubCommand: "on",
-                        commands: {
-                            ...getToggleCommandHandlers(
-                                "all explanation filters",
-                                async (context, enable) => {
-                                    await changeContextConfig(
-                                        {
-                                            explainer: {
-                                                filter: {
-                                                    multiple: enable,
-                                                    reference: {
-                                                        value: enable,
-                                                        list: enable,
-                                                        translate: enable,
-                                                    },
-                                                },
-                                            },
-                                        },
-                                        context,
-                                    );
-                                },
-                            ),
-                            multiple: getToggleHandlerTable(
-                                "explanation filter multiple actions",
-                                async (context, enable) => {
-                                    await changeContextConfig(
-                                        {
-                                            explainer: {
-                                                filter: {
-                                                    multiple: enable,
-                                                },
-                                            },
-                                        },
-                                        context,
-                                    );
-                                },
-                            ),
-                            reference: {
-                                description: "Toggle reference filter",
-                                defaultSubCommand: "on",
-                                commands: {
-                                    ...getToggleCommandHandlers(
-                                        "all explanation reference filters",
-                                        async (context, enable) => {
-                                            await changeContextConfig(
-                                                {
-                                                    explainer: {
-                                                        filter: {
-                                                            reference: {
-                                                                value: enable,
-                                                                list: enable,
-                                                                translate:
-                                                                    enable,
-                                                            },
-                                                        },
-                                                    },
-                                                },
-                                                context,
-                                            );
-                                        },
-                                    ),
-                                    value: getToggleHandlerTable(
-                                        "explainer filter reference by value in the request",
-                                        async (context, enable) => {
-                                            await changeContextConfig(
-                                                {
-                                                    explainer: {
-                                                        filter: {
-                                                            reference: {
-                                                                value: enable,
-                                                            },
-                                                        },
-                                                    },
-                                                },
-                                                context,
-                                            );
-                                        },
-                                    ),
-                                    list: getToggleHandlerTable(
-                                        "explainer filter reference using word lists",
-                                        async (context, enable) => {
-                                            await changeContextConfig(
-                                                {
-                                                    explainer: {
-                                                        filter: {
-                                                            reference: {
-                                                                list: enable,
-                                                            },
-                                                        },
-                                                    },
-                                                },
-                                                context,
-                                            );
-                                        },
-                                    ),
-                                    translate: getToggleHandlerTable(
-                                        "explainer filter reference by translate without context",
-                                        async (context, enable) => {
-                                            await changeContextConfig(
-                                                {
-                                                    explainer: {
-                                                        filter: {
-                                                            reference: {
-                                                                translate:
-                                                                    enable,
-                                                            },
-                                                        },
-                                                    },
-                                                },
-                                                context,
-                                            );
-                                        },
-                                    ),
-                                },
-                            },
-                        },
-                    },
-                },
-            },
-            serviceHost: getServiceHostCommandHandlers(),
+            explainer: configExplainerCommandHandlers,
+            execution: configExecutionCommandHandlers,
             dev: getToggleHandlerTable(
                 "development mode",
                 async (context, enable) => {
@@ -1251,35 +1279,8 @@ export function getConfigCommandHandlers(): CommandHandlerTable {
                     ),
                 },
             },
-            pen: {
-                description: "Toggles click note pen handler.",
-                defaultSubCommand: "on",
-                commands: getToggleCommandHandlers(
-                    "Surface Pen Click Handler",
-                    async (isContext, enable) => {
-                        if (enable) {
-                            spawnPenLauncherProcess("--register");
-                        } else {
-                            spawnPenLauncherProcess("--unregister");
-                        }
-                    },
-                ),
-            },
+
             ports: new ConfigPortsCommandHandler(),
         },
     };
-}
-
-async function spawnPenLauncherProcess(args: string) {
-    return new Promise<child_process.ChildProcess>((resolve, reject) => {
-        const child = child_process.spawn(fileURLToPath(penLauncherPath), [
-            args,
-        ]);
-        child.on("error", (err) => {
-            reject(err);
-        });
-        child.on("spawn", () => {
-            resolve(child);
-        });
-    });
 }

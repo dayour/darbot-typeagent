@@ -27,6 +27,7 @@ import { DispatcherName } from "./dispatcher/dispatcherUtils.js";
 import { ConstructionProvider } from "../agentProvider/agentProvider.js";
 import { MultipleActionConfig } from "../translation/multipleActionSchema.js";
 import { IndexManager } from "./indexManager.js";
+import { IndexingServiceRegistry } from "./indexingServiceRegistry.js";
 import { IndexData } from "image-memory";
 
 const debugSession = registerDebug("typeagent:session");
@@ -105,7 +106,7 @@ export type DispatcherConfig = {
         multiple: MultipleActionConfig;
         history: {
             enabled: boolean;
-            limit: number;
+            limit: number; // number of entities,
         };
         schema: {
             generation: {
@@ -130,6 +131,10 @@ export type DispatcherConfig = {
     // Execution configurations
     execution: {
         history: boolean;
+        activity: boolean;
+        memory: {
+            legacy: boolean; // use legacy memory behavior
+        };
     };
     explainer: {
         enabled: boolean;
@@ -151,6 +156,7 @@ export type DispatcherConfig = {
         autoSave: boolean;
         builtInCache: boolean;
         matchWildcard: boolean;
+        matchEntityWildcard: boolean;
     };
 };
 
@@ -209,6 +215,10 @@ const defaultSessionConfig: SessionConfig = {
     },
     execution: {
         history: true,
+        activity: false, // TODO: experimental.
+        memory: {
+            legacy: true, // use the new memory behavior
+        },
     },
     explainer: {
         enabled: true,
@@ -229,6 +239,7 @@ const defaultSessionConfig: SessionConfig = {
         mergeMatchSets: true, // the session default is different then the default in the cache
         cacheConflicts: true, // the session default is different then the default in the cache
         matchWildcard: true,
+        matchEntityWildcard: true,
         builtInCache: true,
     },
 };
@@ -291,16 +302,22 @@ export class Session {
     public static async create(
         settings?: SessionSettings,
         instanceDir?: string,
+        indexingServiceRegistry?: IndexingServiceRegistry,
     ) {
         const session = new Session(
             { settings, cacheData: {} },
             instanceDir ? await newSessionDir(instanceDir) : undefined,
+            indexingServiceRegistry,
         );
         await session.save();
         return session;
     }
 
-    public static async load(instanceDir: string, dir: string) {
+    public static async load(
+        instanceDir: string,
+        dir: string,
+        indexingServiceRegistry?: IndexingServiceRegistry,
+    ) {
         const dirPath = getSessionDirPath(instanceDir, dir);
         const sessionData = await readSessionData(dirPath);
         debugSession(`Loading session: ${dir}`);
@@ -308,14 +325,21 @@ export class Session {
             `Settings: ${JSON.stringify(sessionData.settings, undefined, 2)}`,
         );
 
-        return new Session(sessionData, dirPath);
+        return new Session(sessionData, dirPath, indexingServiceRegistry);
     }
 
-    public static async restoreLastSession(instanceDir: string) {
+    public static async restoreLastSession(
+        instanceDir: string,
+        indexingServiceRegistry?: IndexingServiceRegistry,
+    ) {
         const sessionDir = (await loadSessions(instanceDir))?.lastSession;
         if (sessionDir !== undefined) {
             try {
-                return this.load(instanceDir, sessionDir);
+                return this.load(
+                    instanceDir,
+                    sessionDir,
+                    indexingServiceRegistry,
+                );
             } catch (e: any) {
                 throw new Error(
                     `Unable to restore last session '${sessionDir}': ${e.message}`,
@@ -328,6 +352,7 @@ export class Session {
     private constructor(
         sessionData: SessionData,
         public readonly sessionDirPath?: string,
+        indexingServiceRegistry?: IndexingServiceRegistry,
     ) {
         this.settings = sessionData.settings ?? {};
         this.config = cloneConfig(defaultSessionConfig);
@@ -345,7 +370,14 @@ export class Session {
                 sessionData.indexes = [];
             }
 
-            IndexManager.load(sessionData.indexes, sessionDirPath);
+            // Pass the registry to IndexManager.load
+            IndexManager.load(
+                sessionData.indexes,
+                sessionDirPath,
+                indexingServiceRegistry,
+            ).catch((error) => {
+                console.warn(`Failed to load indexing services: ${error}`);
+            });
         }
     }
 

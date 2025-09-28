@@ -9,6 +9,8 @@ export function toStringSchemaType(
 ): string {
     let result: string;
     switch (type.type) {
+        case "any":
+            return "any";
         case "string":
             return "string";
         case "number":
@@ -35,6 +37,10 @@ export function toStringSchemaType(
             result = type.types.map((t) => toStringSchemaType(t)).join(" | ");
             paran = paran && type.types.length > 1;
             break;
+        case "false":
+            return "false";
+        case "true":
+            return "true";
     }
     return paran ? `(${result})` : result;
 }

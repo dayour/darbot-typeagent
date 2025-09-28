@@ -42,6 +42,7 @@ import {
     answerContextToString,
 } from "./answerContext.js";
 import { flattenResultsArray, Scored, trimStringLength } from "./common.js";
+import { createMultipleChoiceQuestion } from "./searchLib.js";
 
 export type AnswerTranslator =
     TypeChatJsonTranslator<answerSchema.AnswerResponse>;
@@ -121,20 +122,89 @@ export type AnswerGeneratorSettings = {
      * Additional instructions for the model
      */
     modelInstructions?: PromptSection[] | undefined;
+    includeContextSchema?: boolean | undefined;
 };
 
 /**
  * Generate a natural language answer for question about a conversation using the provided search results as context
+ *  - Each search result is first turned into an answer individually
+ *  - If more than one search result provided, then individual answers are combined into a single answer
  * If the context exceeds the generator.setting.maxCharsInBudget, will break up the context into
  * chunks, run them in parallel, and then merge the answers found in individual chunks
  * @param conversation conversation about which this is a question
- * @param generator answer generator to use
+ * @param generator answer generator to use to turn search results onto language answers: @see AnswerGenerator
  * @param question question that was asked
- * @param searchResult the results of running a search query for the question on the conversation
+ * @param searchResults the results of running a search query for the question on the conversation
  * @param progress Progress callback
  * @returns Answers
  */
 export async function generateAnswer(
+    conversation: IConversation,
+    generator: IAnswerGenerator,
+    question: string,
+    searchResults: ConversationSearchResult | ConversationSearchResult[],
+    progress?: asyncArray.ProcessProgress<
+        contextSchema.AnswerContext,
+        Result<answerSchema.AnswerResponse>
+    >,
+    contextOptions?: AnswerContextOptions,
+): Promise<Result<answerSchema.AnswerResponse>> {
+    let answerResponse: Result<answerSchema.AnswerResponse>;
+    if (!Array.isArray(searchResults)) {
+        answerResponse = await generateAnswerFromSearchResult(
+            conversation,
+            generator,
+            question,
+            searchResults,
+            progress,
+            contextOptions,
+        );
+    } else {
+        if (searchResults.length === 0) {
+            return error("No search results");
+        }
+        if (searchResults.length === 1) {
+            answerResponse = await generateAnswerFromSearchResult(
+                conversation,
+                generator,
+                question,
+                searchResults[0],
+                progress,
+                contextOptions,
+            );
+        } else {
+            // Get answers for individual searches in parallel
+            const partialResults = await asyncArray.mapAsync(
+                searchResults,
+                generator.settings.concurrency,
+                (sr) =>
+                    generateAnswerFromSearchResult(
+                        conversation,
+                        generator,
+                        question,
+                        sr,
+                        progress,
+                        contextOptions,
+                    ),
+            );
+            // Use partial responses to build a complete answer
+            const partialResponses: answerSchema.AnswerResponse[] = [];
+            for (const result of partialResults) {
+                if (!result.success) {
+                    return result;
+                }
+                partialResponses.push(result.data);
+            }
+            answerResponse = await generator.combinePartialAnswers(
+                question,
+                partialResponses,
+            );
+        }
+    }
+    return answerResponse;
+}
+
+async function generateAnswerFromSearchResult(
     conversation: IConversation,
     generator: IAnswerGenerator,
     question: string,
@@ -151,7 +221,11 @@ export async function generateAnswer(
         contextOptions,
     );
     const contextContent = answerContextToString(context);
-    if (contextContent.length <= generator.settings.maxCharsInBudget) {
+    const chunking = contextOptions?.chunking ?? true;
+    if (
+        contextContent.length <= generator.settings.maxCharsInBudget ||
+        !chunking
+    ) {
         // Context is small enough
         return generator.generateAnswer(question, contextContent);
     }
@@ -207,21 +281,23 @@ export async function generateAnswerInChunks(
     }
 
     let chunkAnswers: answerSchema.AnswerResponse[] = [];
-    const structuredChunks = getStructuredChunks(chunks);
-    if (structuredChunks.length > 0) {
-        const structuredAnswers = await runGenerateAnswers(
+    const knowledgeChunks = getKnowledgeChunks(chunks);
+    let hasKnowledgeAnswer = false;
+    if (knowledgeChunks.length > 0) {
+        const knowledgeAnswers = await runGenerateAnswers(
             answerGenerator,
             question,
-            structuredChunks,
+            knowledgeChunks,
             progress,
         );
-        if (!structuredAnswers.success) {
-            return structuredAnswers;
+        if (!knowledgeAnswers.success) {
+            return knowledgeAnswers;
         }
-        chunkAnswers.push(...structuredAnswers.data);
+        chunkAnswers.push(...knowledgeAnswers.data);
+        hasKnowledgeAnswer = hasAnswer(chunkAnswers);
     }
 
-    if (!hasAnswer(chunkAnswers) || !answerGenerator.settings.fastStop) {
+    if (!hasKnowledgeAnswer || !answerGenerator.settings.fastStop) {
         // Generate partial answers from each message chunk
         const messageChunks = chunks.filter(
             (c) => c.messages !== undefined && c.messages.length > 0,
@@ -253,27 +329,61 @@ export async function generateAnswerInChunks(
         return answers.some((a) => a.type === "Answered");
     }
 
-    function getStructuredChunks(
+    function getKnowledgeChunks(
         chunks: contextSchema.AnswerContext[],
     ): contextSchema.AnswerContext[] {
         const structuredChunks: contextSchema.AnswerContext[] = [];
         for (const chunk of chunks) {
-            let structuredChunk: contextSchema.AnswerContext | undefined =
+            let knowledgeChunk: contextSchema.AnswerContext | undefined =
                 undefined;
             if (chunk.entities) {
-                structuredChunk ??= {};
-                structuredChunk.entities = chunk.entities;
+                knowledgeChunk ??= {};
+                knowledgeChunk.entities = chunk.entities;
             }
             if (chunk.topics) {
-                structuredChunk ??= {};
-                structuredChunk.topics = chunk.topics;
+                knowledgeChunk ??= {};
+                knowledgeChunk.topics = chunk.topics;
             }
-            if (structuredChunk !== undefined) {
-                structuredChunks.push(structuredChunk);
+            if (knowledgeChunk !== undefined) {
+                structuredChunks.push(knowledgeChunk);
             }
         }
         return structuredChunks;
     }
+}
+
+/**
+ * *Early Experimental*
+ * Generate answer from a set of multiple answer choices.
+ * @param conversation
+ * @param generator answer generator to use
+ * @param question question the user asked
+ * @param answerChoices Answer should be one of these
+ * @param searchResult searchResults to use for answering the question
+ * @param progress
+ * @param contextOptions
+ */
+export function generateMultipleChoiceAnswer(
+    conversation: IConversation,
+    generator: IAnswerGenerator,
+    question: string,
+    answerChoices: string[],
+    searchResults: ConversationSearchResult | ConversationSearchResult[],
+    progress?: asyncArray.ProcessProgress<
+        contextSchema.AnswerContext,
+        Result<answerSchema.AnswerResponse>
+    >,
+    contextOptions?: AnswerContextOptions,
+) {
+    question = createMultipleChoiceQuestion(question, answerChoices);
+    return generateAnswer(
+        conversation,
+        generator,
+        question,
+        searchResults,
+        progress,
+        contextOptions,
+    );
 }
 
 /**
@@ -317,11 +427,14 @@ export class AnswerGenerator implements IAnswerGenerator {
         prompt.push(
             createContextPrompt(
                 this.contextTypeName,
-                this.contextSchema,
+                this.settings.includeContextSchema !== undefined &&
+                    this.settings.includeContextSchema
+                    ? this.contextSchema
+                    : "",
                 contextContent,
-            ).content as string,
+            ),
         );
-        const promptText = prompt.join("\n");
+        const promptText = prompt.join("\n\n");
         return this.answerTranslator.translate(
             promptText,
             this.settings.modelInstructions,
@@ -500,12 +613,7 @@ export function getRelevantMessagesForAnswer(
         if (message.textChunks.length === 0) {
             continue;
         }
-        const relevantMessage: contextSchema.RelevantMessage = {
-            messageText:
-                message.textChunks.length === 1
-                    ? message.textChunks[0]
-                    : message.textChunks,
-        };
+        const relevantMessage: contextSchema.RelevantMessage = {};
         const meta = message.metadata;
         if (meta) {
             relevantMessage.from = meta.source;
@@ -514,6 +622,10 @@ export function getRelevantMessagesForAnswer(
         if (message.timestamp) {
             relevantMessage.timestamp = new Date(message.timestamp);
         }
+        relevantMessage.messageText =
+            message.textChunks.length === 1
+                ? message.textChunks[0]
+                : message.textChunks;
         relevantMessages.push(relevantMessage);
         if (topK !== undefined && topK > 0 && relevantMessages.length >= topK) {
             break;
@@ -594,13 +706,17 @@ function createRelevantKnowledge(
 function createQuestionPrompt(question: string): string {
     let prompt: string[] = [
         "The following is a user question:",
-        `===\n${question}\n===`, // Leave the '/n' here
+        "===",
+        question,
+        "",
+        "===",
         "- The included [ANSWER CONTEXT] contains information that MAY be relevant to answering the question.",
-        "- Answer the user question PRECISELY using ONLY relevant topics, entities, actions, messages and time ranges/timestamps found in [ANSWER CONTEXT].",
-        "- Return 'NoAnswer' if unsure or if the topics and entity names/types in the question are not in [ANSWER CONTEXT].",
+        "- Answer the user question PRECISELY using ONLY information EXPLICITLY provided in the topics, entities, actions, messages and time ranges/timestamps found in [ANSWER CONTEXT]",
+        "- Return 'NoAnswer' if you are unsure, , if the answer is not explicitly in [ANSWER CONTEXT], or if the topics or {entity names, types and facets} in the question are not found in [ANSWER CONTEXT].",
         "- Use the 'name', 'type' and 'facets' properties of the provided JSON entities to identify those highly relevant to answering the question.",
-        "- When asked for lists, ensure the the list contents answer the question and nothing else.",
-        "E.g. for the question 'List all books': List only the books in [ANSWER CONTEXT].",
+        "- 'origin' and 'audience' fields contain the names of entities involved in communication about the knowledge",
+        "**Important:** Communicating DOES NOT imply associations such as authorship, ownership etc. E.g. origin: [X] telling audience [Y, Z] communicating about a book does not imply authorship.",
+        "- When asked for lists, ensure the list contents answer the question and nothing else. E.g. for the question 'List all books': List only the books in [ANSWER CONTEXT].",
         "- Use direct quotes only when needed or asked. Otherwise answer in your own words.",
         "- Your answer is readable and complete, with appropriate formatting: line breaks, numbered lists, bullet points etc.",
     ];
@@ -611,15 +727,12 @@ function createContextPrompt(
     typeName: string,
     schema: string,
     context: string,
-): PromptSection {
+): string {
     let content =
-        `[ANSWER CONTEXT] for answering user questions is a JSON object of type ${typeName} according to the following TypeScript definitions:\n` +
-        `\`\`\`\n${schema}\`\`\`\n` +
-        `[ANSWER CONTEXT]\n` +
-        `===\n${context}\n===\n`;
-
-    return {
-        role: "user",
-        content,
-    };
+        schema && schema.length > 0
+            ? `[ANSWER CONTEXT] for answering user questions is a JSON object of type ${typeName} according to the following TypeScript definitions:\n` +
+              `\`\`\`\n${schema}\`\`\`\n`
+            : "";
+    content += `[ANSWER CONTEXT]\n` + `===\n${context}\n===\n`;
+    return content;
 }

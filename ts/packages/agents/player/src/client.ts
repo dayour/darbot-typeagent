@@ -3,21 +3,20 @@
 
 import path from "node:path";
 import {
-    ChangeVolumeAction,
     DeletePlaylistAction,
     GetFavoritesAction,
     GetPlaylistAction,
     PlayAlbumAction,
     PlayFromCurrentTrackListAction,
     PlayArtistAction,
-    PlayerAction,
+    PlayerActions,
     PlayGenreAction,
     PlayRandomAction,
     PlayTrackAction,
     SearchTracksAction,
-    SelectDeviceAction,
-    SetVolumeAction,
-    ShuffleAction,
+    SearchForPlaylistsAction,
+    GetFromCurrentPlaylistListAction,
+    AddCurrentTrackToPlaylistAction,
 } from "./agent/playerSchema.js";
 import { createTokenProvider } from "./defaultTokenProvider.js";
 import chalk from "chalk";
@@ -34,15 +33,10 @@ import { applyFilterExpr } from "./trackFilter.js";
 import {
     play,
     getUserProfile,
-    getDevices,
     search,
-    setVolume,
-    limitMax,
     getFavoriteTracks,
     createPlaylist,
     deletePlaylist,
-    getPlaylists,
-    getPlaybackState,
     getPlaylistTracks,
     pause,
     next,
@@ -50,24 +44,24 @@ import {
     shuffle,
     getQueue,
     getAlbum,
+    followPlaylist,
+    addTracksToPlaylist,
+    getRecommendationsFromTrackCollection,
 } from "./endpoints.js";
-import {
-    htmlStatus,
-    listAvailableDevices,
-    printStatus,
-    selectDevice,
-} from "./playback.js";
+import { htmlStatus, printStatus } from "./playback.js";
 import { SpotifyService } from "./service.js";
 import { fileURLToPath } from "node:url";
-import { hostname } from "node:os";
 import {
     initializeUserData,
     mergeUserDataKind,
     saveUserData,
     addUserDataStrings,
     UserData,
+    addFullTracks,
+    getPlaylistsFromUserData,
+    updatePlaylists,
 } from "./userData.js";
-import registerDebug from "debug";
+
 import {
     ActionIO,
     DisplayContent,
@@ -89,9 +83,27 @@ import {
     getTrackFromEntity,
 } from "./search.js";
 import { toTrackObjectFull } from "./spotifyUtils.js";
-
-const debugSpotify = registerDebug("typeagent:spotify");
-const debugSpotifyError = registerDebug("typeagent:spotify:error");
+import { debugSpotify, debugSpotifyError } from "./debug.js";
+import {
+    LocalSettings,
+    RoamingSettings,
+    loadLocalSettings,
+    loadRoamingSettings,
+} from "./settings.js";
+import {
+    ensureSelectedDeviceId,
+    getSelectedDevicePlaybackState,
+    listDevicesAction,
+    selectDeviceAction,
+    setDefaultDeviceAction,
+    showSelectedDeviceAction,
+} from "./devices.js";
+import {
+    changeVolumeAction,
+    setMaxVolumeAction,
+    setVolumeAction,
+} from "./volume.js";
+import e from "express";
 
 function createWarningActionResult(message: string) {
     debugSpotifyError(message);
@@ -122,13 +134,16 @@ function getTypeChatLanguageModel() {
 
 export interface IClientContext {
     service: SpotifyService;
-    deviceId?: string | undefined;
     currentTrackList?: ITrackCollection;
+    currentPlaylistList?: SpotifyApi.PlaylistObjectSimplified[];
     lastTrackStartIndex?: number;
     lastTrackEndIndex?: number;
     trackListMap: Map<string, ITrackCollection>;
     trackListCount: number;
     userData?: UserData | undefined;
+    localSettings: LocalSettings;
+    roamingSettings: RoamingSettings;
+    selectedDeviceName?: string | undefined;
 }
 
 async function printTrackNames(
@@ -206,6 +221,46 @@ export async function loadHistoryFile(
     }
 }
 
+async function htmlPlaylistNames(
+    playlists: SpotifyApi.PlaylistObjectSimplified[],
+    headText = "Playlists",
+) {
+    const displayContent: DisplayContent = {
+        type: "html",
+        content: "",
+    };
+
+    const actionResult: ActionResult = {
+        displayContent,
+        historyText: "",
+        entities: [],
+    };
+    let prevUrl = "";
+    let content = `<div class='playlist-list scroll_enabled'><div>${headText}...</div><ol>\n`;
+    for (const playlist of playlists) {
+        if (playlist) {
+            // if the playlist has an image, use it
+            if (
+                playlist.images &&
+                playlist.images.length > 0 &&
+                playlist.images[0].url &&
+                playlist.images[0].url != prevUrl
+            ) {
+                content += `  <li><div class='track-album-cover-container'>\n <div class='track-info'> <div class='playlist-title'>${playlist.name}</div></div>\n`;
+                content += `  <img src='${playlist.images[0].url}' alt='playlist image' class='track-album-cover' />\n`;
+                prevUrl = playlist.images[0].url;
+                content += `  </div></li>\n`;
+            } else {
+                content += `  <li><span class='playlist-title'>${playlist.name}</span></li>\n`;
+            }
+        }
+    }
+    content += "</ol></div>";
+    displayContent.content = content;
+    actionResult.historyText = `Updated the current playlist list with the numbered list of playlists on the screen`;
+    return actionResult;
+}
+
 async function htmlTrackNames(
     trackCollection: ITrackCollection,
     headText = "Tracks",
@@ -218,7 +273,7 @@ async function htmlTrackNames(
 
     const actionResult: ActionResult = {
         displayContent,
-        literalText: "",
+        historyText: "",
         entities: [],
     };
     let prevUrl = "";
@@ -274,7 +329,7 @@ async function htmlTrackNames(
             }
         }
         displayContent.content += "</ol></div>";
-        actionResult.literalText =
+        actionResult.historyText =
             "Updated the current track list with the numbered list of tracks on the screen";
     } else if (selectedTracks.length === 1) {
         const track = selectedTracks[0];
@@ -307,7 +362,7 @@ async function htmlTrackNames(
         const litArtists =
             litArtistsPrefix +
             track.artists.map((artist) => artist.name).join(", ");
-        actionResult.literalText = `Now playing: ${track.name} from album ${track.album.name} with ${litArtists}`;
+        actionResult.historyText = `Now playing: ${track.name} from album ${track.album.name} with ${litArtists}`;
         if (track.album.images.length > 0 && track.album.images[0].url) {
             displayContent.content = "<div class='track-list scroll_enabled'>";
             displayContent.content +=
@@ -331,6 +386,13 @@ async function htmlTrackNames(
         return createNotFoundActionResult("tracks");
     }
     return actionResult;
+}
+
+function updatePlaylistList(
+    playlists: SpotifyApi.PlaylistObjectSimplified[],
+    context: IClientContext,
+) {
+    context.currentPlaylistList = playlists;
 }
 
 async function updateTrackListAndPrint(
@@ -360,17 +422,12 @@ export async function getClientContext(
         id: userdata?.id,
         username: userdata?.display_name,
     });
-    const devices = await getDevices(service);
-    let deviceId: string | undefined;
-    if (devices && devices.devices.length > 0) {
-        const activeDevice =
-            devices.devices.find((device) => device.is_active) ??
-            devices.devices.find((device) => device.name === hostname()) ??
-            devices.devices[0];
-        deviceId = activeDevice.id ?? undefined;
-    }
+
+    const roamingSettings = await loadRoamingSettings(instanceStorage);
+    const localSettings = await loadLocalSettings(instanceStorage);
     return {
-        deviceId,
+        localSettings,
+        roamingSettings,
         service,
         trackListMap: new Map<string, ITrackCollection>(),
         trackListCount: 0,
@@ -378,6 +435,28 @@ export async function getClientContext(
             ? await initializeUserData(instanceStorage, service)
             : undefined,
     };
+}
+
+export async function trackCollectionRadio(
+    trackCollection: ITrackCollection,
+    clientContext: IClientContext,
+    nsamples = 2,
+) {
+    const totalRecommendations = [] as SpotifyApi.RecommendationTrackObject[];
+    for (let i = 0; i < nsamples; i++) {
+        const recommendations = await getRecommendationsFromTrackCollection(
+            clientContext.service,
+            trackCollection,
+        );
+        totalRecommendations.push(...recommendations.tracks);
+    }
+    if (totalRecommendations.length > 0) {
+        const collection =
+            TrackCollection.fromRecommendationTracks(totalRecommendations);
+        return collection;
+    } else {
+        return undefined;
+    }
 }
 
 function internTrackCollection(
@@ -406,45 +485,39 @@ export async function searchTracks(
     }
 }
 
-export async function searchAlbum(albumName: string, context: IClientContext) {
+export async function searchForPlaylists(
+    queryString: string,
+    context: IClientContext,
+) {
     const query: SpotifyApi.SearchForItemParameterObject = {
-        q: `album:"${albumName}"`,
-        type: "album",
-        limit: 50,
+        q: queryString,
+        type: "playlist",
+        limit: 20,
         offset: 0,
     };
     const data = await search(query, context.service);
-    if (data && data.albums && data.albums.items.length > 0) {
-        for (const album of data.albums.items) {
-            if (album.name === albumName) {
-                return album;
-            }
-        }
+    if (data && data.playlists && data.playlists.items.length > 0) {
+        return data.playlists.items;
     }
-    return undefined;
 }
 
 async function playTrackCollection(
     trackCollection: ITrackCollection,
     clientContext: IClientContext,
 ) {
-    if (clientContext.deviceId) {
-        const tracks = trackCollection.getTracks();
-        const uris = tracks.map((track) => track.uri);
-        console.log(chalk.cyanBright("Playing..."));
-        await printTrackNames(trackCollection, clientContext);
-        const actionResult = await htmlTrackNames(trackCollection, "Playing");
-        await play(
-            clientContext.service,
-            clientContext.deviceId,
-            uris,
-            trackCollection.getContext(),
-        );
-        return actionResult;
-    } else {
-        const message = "No active device found";
-        return createActionResultFromTextDisplay(chalk.red(message), message);
-    }
+    const deviceId = await ensureSelectedDeviceId(clientContext);
+    const tracks = trackCollection.getTracks();
+    const uris = tracks.map((track) => track.uri);
+    console.log(chalk.cyanBright("Playing..."));
+    await printTrackNames(trackCollection, clientContext);
+    const actionResult = await htmlTrackNames(trackCollection, "Playing");
+    await play(
+        clientContext.service,
+        deviceId,
+        uris,
+        trackCollection.getContext(),
+    );
+    return actionResult;
 }
 
 async function playRandomAction(
@@ -484,6 +557,11 @@ async function playTrackAction(
 
     if (equivalentNames(action.parameters.trackName, tracks[0].name)) {
         tracks.splice(1);
+        const userData = clientContext.userData;
+        if (userData) {
+            addFullTracks(userData.data, tracks);
+            await saveUserData(userData.instanceStorage, userData.data);
+        }
     }
     const collection = new TrackCollection(tracks);
     return playTrackCollection(collection, clientContext);
@@ -668,32 +746,16 @@ async function playGenreAction(
     return playTrackCollection(collection, clientContext);
 }
 
-function ensureClientId(state: SpotifyApi.CurrentPlaybackResponse) {
-    if (state.device.id !== null) {
-        return state.device.id;
-    }
-    console.log(
-        chalk.red(
-            `Current device '${state.device.name}' is a restricted device and cannot be controlled.`,
-        ),
-    );
-    return undefined;
-}
-
 async function resumeActionCall(clientContext: IClientContext) {
-    const state = await getPlaybackState(clientContext.service);
+    const state = await getSelectedDevicePlaybackState(clientContext);
     if (!state) {
         return createWarningActionResult("No active playback to resume");
-    }
-    const deviceId = ensureClientId(state);
-    if (deviceId === undefined) {
-        return createWarningActionResult("No device active");
     }
 
     if (state.is_playing) {
         console.log(chalk.yellow("Music already playing"));
     } else {
-        await play(clientContext.service, deviceId);
+        await play(clientContext.service, state.device.id!);
     }
     await printStatus(clientContext);
     const status = await htmlStatus(clientContext);
@@ -703,18 +765,14 @@ async function resumeActionCall(clientContext: IClientContext) {
 async function pauseActionCall(
     clientContext: IClientContext,
 ): Promise<ActionResult> {
-    const state = await getPlaybackState(clientContext.service);
+    const state = await getSelectedDevicePlaybackState(clientContext);
     if (!state) {
         return createWarningActionResult("No active playback to pause");
-    }
-    const deviceId = ensureClientId(state);
-    if (deviceId === undefined) {
-        return createWarningActionResult("No device active");
     }
     if (!state.is_playing) {
         console.log(chalk.yellow("Music already stopped."));
     } else {
-        await pause(clientContext.service, deviceId);
+        await pause(clientContext.service, state.device.id!);
     }
     await printStatus(clientContext);
     const statusHtml = await htmlStatus(clientContext);
@@ -722,50 +780,38 @@ async function pauseActionCall(
 }
 
 async function nextActionCall(clientContext: IClientContext) {
-    const state = await getPlaybackState(clientContext.service);
+    const state = await getSelectedDevicePlaybackState(clientContext);
     if (!state) {
         return createWarningActionResult("No active playback to move next to");
     }
-    const deviceId = ensureClientId(state);
-    if (deviceId === undefined) {
-        return createWarningActionResult("No device active");
-    }
 
-    await next(clientContext.service, deviceId);
+    await next(clientContext.service, state.device.id!);
     await printStatus(clientContext);
     const statusHtml = await htmlStatus(clientContext);
     return statusHtml;
 }
 
 async function previousActionCall(clientContext: IClientContext) {
-    const state = await getPlaybackState(clientContext.service);
+    const state = await getSelectedDevicePlaybackState(clientContext);
     if (!state) {
         return createWarningActionResult(
             "No active playback to move previous to",
         );
     }
-    const deviceId = ensureClientId(state);
-    if (deviceId === undefined) {
-        return createWarningActionResult("No device active");
-    }
 
-    await previous(clientContext.service, deviceId);
+    await previous(clientContext.service, state.device.id!);
     await printStatus(clientContext);
     const statusHtml = await htmlStatus(clientContext);
     return statusHtml;
 }
 
 async function shuffleActionCall(clientContext: IClientContext, on: boolean) {
-    const state = await getPlaybackState(clientContext.service);
+    const state = await getSelectedDevicePlaybackState(clientContext);
     if (!state) {
         return createWarningActionResult("No active playback to shuffle");
     }
-    const deviceId = ensureClientId(state);
-    if (deviceId === undefined) {
-        return createWarningActionResult("No device active");
-    }
 
-    await shuffle(clientContext.service, deviceId, on);
+    await shuffle(clientContext.service, state.device.id!, on);
     await printStatus(clientContext);
     const statusHtml = await htmlStatus(clientContext);
     return statusHtml;
@@ -778,9 +824,10 @@ export function getUserDataStrings(clientContext: IClientContext) {
 }
 
 export async function handleCall(
-    action: TypeAgentAction<PlayerAction>,
+    action: TypeAgentAction<PlayerActions>,
     clientContext: IClientContext,
     actionIO: ActionIO,
+    instanceStorage?: Storage,
 ): Promise<ActionResult> {
     switch (action.actionName) {
         case "playRandom":
@@ -832,62 +879,48 @@ export async function handleCall(
             return previousActionCall(clientContext);
         }
         case "shuffle": {
-            const shuffleAction = action as ShuffleAction;
-            return shuffleActionCall(
-                clientContext,
-                shuffleAction.parameters.on,
-            );
+            return shuffleActionCall(clientContext, action.parameters.on);
         }
         case "resume": {
             return resumeActionCall(clientContext);
         }
         case "listDevices": {
-            const result = await listAvailableDevices(clientContext);
-            return result
-                ? createActionResultFromHtmlDisplay(result.html, result.lit)
-                : createErrorActionResult("No devices found");
+            return listDevicesAction(clientContext);
         }
         case "selectDevice": {
-            const selectDeviceAction = action as SelectDeviceAction;
-            const keyword = selectDeviceAction.parameters.keyword;
-            const result = await selectDevice(keyword, clientContext);
-            if (result) {
-                const { html, text } = result;
-                return createActionResultFromHtmlDisplay(html, text);
-            } else return createErrorActionResult("No devices found");
+            return selectDeviceAction(
+                clientContext,
+                action.parameters.deviceName,
+            );
+        }
+
+        case "setDefaultDevice":
+            return setDefaultDeviceAction(
+                clientContext,
+                action.parameters.deviceName,
+                instanceStorage,
+            );
+        case "showSelectedDevice": {
+            return showSelectedDeviceAction(clientContext);
         }
         case "setVolume": {
-            const setVolumeAction = action as SetVolumeAction;
-            let newVolumeLevel = setVolumeAction.parameters.newVolumeLevel;
-            if (newVolumeLevel > 50) {
-                newVolumeLevel = 50;
-            }
-            actionIO.setDisplay(
-                chalk.yellowBright(`setting volume to ${newVolumeLevel} ...`),
+            const newVolumeLevel = action.parameters.newVolumeLevel;
+            return setVolumeAction(clientContext, newVolumeLevel, actionIO);
+        }
+        case "setMaxVolume": {
+            return setMaxVolumeAction(
+                clientContext,
+                action.parameters.newMaxVolumeLevel,
+                actionIO,
+                instanceStorage,
             );
-            await setVolume(clientContext.service, newVolumeLevel);
-            return htmlStatus(clientContext);
         }
         case "changeVolume": {
-            const changeVolumeAction = action as ChangeVolumeAction;
-            const volumeChangeAmount =
-                changeVolumeAction.parameters.volumeChangePercentage;
-            const playback = await getPlaybackState(clientContext.service);
-            if (playback && playback.device) {
-                const volpct = playback.device.volume_percent || 50;
-                let nv = Math.floor(
-                    (1.0 + volumeChangeAmount / 100.0) * volpct,
-                );
-                if (nv > 50) {
-                    nv = 50;
-                }
-                actionIO.setDisplay(
-                    chalk.yellowBright(`setting volume to ${nv} ...`),
-                );
-                await setVolume(clientContext.service, nv);
-                return htmlStatus(clientContext);
-            }
-            return createErrorActionResult("No active device found");
+            return changeVolumeAction(
+                clientContext,
+                action.parameters.volumeChangePercentage,
+                actionIO,
+            );
         }
         case "searchTracks": {
             const searchTracksAction = action as SearchTracksAction;
@@ -900,27 +933,84 @@ export async function handleCall(
             }
             return createNotFoundActionResult("tracks", queryString);
         }
-        case "listPlaylists": {
-            const playlists = await getPlaylists(clientContext.service);
+        case "searchForPlaylists": {
+            const searchPlaylistsAction = action as SearchForPlaylistsAction;
+            const queryString = searchPlaylistsAction.parameters.query;
+            const playlists = await searchForPlaylists(
+                queryString,
+                clientContext,
+            );
             if (playlists) {
-                let html = "<div>Playlists...</div>";
-                for (const playlist of playlists.items) {
-                    console.log(chalk.magentaBright(`${playlist.name}`));
-                    html += `<div>${playlist.name}</div>`;
+                updatePlaylistList(playlists, clientContext);
+                return htmlPlaylistNames(playlists, "PlaylistSearch Results");
+            }
+            return createNotFoundActionResult("playlists", queryString);
+        }
+        case "listPlaylists": {
+            if (clientContext.userData !== undefined) {
+                const playlists = await getPlaylistsFromUserData(
+                    clientContext.service,
+                    clientContext.userData.data,
+                );
+                if (playlists) {
+                    const sortedPlaylists = playlists.sort((a, b) =>
+                        a.name.localeCompare(b.name),
+                    );
+
+                    let html = "<div>Playlists...</div>";
+                    for (const playlist of sortedPlaylists) {
+                        html += `<div><span class="playlist-title">${playlist.name}</span> (<span>${playlist.tracks.total} tracks</span>)</div>`;
+                    }
+                    const actionResult =
+                        createActionResultFromHtmlDisplay(html);
+                    actionResult.historyText = "Listed your playlists";
+                    return actionResult;
                 }
-                return createActionResultFromTextDisplay(html);
             }
             return createErrorActionResult("No playlists found");
         }
         case "getPlaylist": {
             const getPlaylistAction = action as GetPlaylistAction;
             const playlistName = getPlaylistAction.parameters.name;
-            const playlists = await getPlaylists(clientContext.service);
-            const playlist = playlists?.items.find((playlist) => {
-                return playlist.name
+            if (!clientContext.userData) {
+                return createErrorActionResult("No user data found");
+            }
+            const playlists = await getPlaylistsFromUserData(
+                clientContext.service,
+                clientContext.userData!.data,
+            );
+            let playlist = playlists?.find((pl) => {
+                return pl.name
                     .toLowerCase()
                     .includes(playlistName.toLowerCase());
             });
+            if (!playlist) {
+                //look for playlist through search
+                const searchPlaylists = await searchForPlaylists(
+                    playlistName,
+                    clientContext,
+                );
+                if (searchPlaylists && searchPlaylists.length > 0) {
+                    for (const pl of searchPlaylists) {
+                        if (
+                            pl.name
+                                .toLowerCase()
+                                .includes(playlistName.toLowerCase())
+                        ) {
+                            playlist = pl;
+                            await followPlaylist(
+                                clientContext.service,
+                                playlist.id,
+                            );
+                            await updatePlaylists(
+                                clientContext.service,
+                                clientContext.userData!.data,
+                            );
+                            break;
+                        }
+                    }
+                }
+            }
             if (playlist) {
                 const playlistResponse = await getPlaylistTracks(
                     clientContext.service,
@@ -941,12 +1031,61 @@ export async function handleCall(
             }
             return createNotFoundActionResult(`playlist ${playlistName}`);
         }
+        case "getFromCurrentPlaylistList": {
+            const getFromCurrentPlaylistListAction =
+                action as GetFromCurrentPlaylistListAction;
+            let playlists = clientContext.currentPlaylistList;
+            if (!playlists) {
+                return createErrorActionResult("No playlists found");
+            } else {
+                const index =
+                    getFromCurrentPlaylistListAction.parameters.playlistNumber -
+                    1;
+                if (index < 0 || index >= playlists.length) {
+                    return createErrorActionResult(
+                        `Playlist number ${getFromCurrentPlaylistListAction.parameters.playlistNumber} not found in current playlist list`,
+                    );
+                }
+                const playlist = playlists[index];
+                if (playlist) {
+                    await followPlaylist(clientContext.service, playlist.id);
+                    await updatePlaylists(
+                        clientContext.service,
+                        clientContext.userData!.data,
+                    );
+
+                    const playlistResponse = await getPlaylistTracks(
+                        clientContext.service,
+                        playlist.id,
+                    );
+
+                    if (playlistResponse) {
+                        const collection = new PlaylistTrackCollection(
+                            playlist,
+                            playlistResponse.items.map((item) => item.track!),
+                        );
+                        console.log(chalk.magentaBright("Playlist:"));
+                        await updateTrackListAndPrint(
+                            collection,
+                            clientContext,
+                        );
+                        return htmlTrackNames(
+                            collection,
+                            `Playlist: ${playlist.name}`,
+                        );
+                    }
+                } else {
+                    return createErrorActionResult("No playlist found");
+                }
+            }
+            return createErrorActionResult("No playlist found");
+        }
         case "getAlbum": {
             let album: SpotifyApi.AlbumObjectSimplified | undefined = undefined;
             let status: SpotifyApi.CurrentPlaybackResponse | undefined =
                 undefined;
             // get album of current playing track and load it as track collection
-            status = await getPlaybackState(clientContext.service);
+            status = await getSelectedDevicePlaybackState(clientContext);
             if (status && status.item && status.item.type === "track") {
                 const track = status.item as SpotifyApi.TrackObjectFull;
                 album = track.album;
@@ -964,7 +1103,7 @@ export async function handleCall(
                 ) {
                     await play(
                         clientContext.service,
-                        clientContext.deviceId!,
+                        await ensureSelectedDeviceId(clientContext),
                         [],
                         album.uri,
                         status.item.track_number - 1,
@@ -987,11 +1126,7 @@ export async function handleCall(
         }
         case "getFavorites": {
             const getFavoritesAction = action as GetFavoritesAction;
-            const countOption = getFavoritesAction.parameters?.count;
-            let count = limitMax;
-            if (countOption !== undefined) {
-                count = countOption;
-            }
+            const count = getFavoritesAction.parameters?.count;
             const tops = await getFavoriteTracks(clientContext.service, count);
             if (tops) {
                 const tracks = tops.map((pto) => pto.track!);
@@ -1121,20 +1256,65 @@ export async function handleCall(
         case "deletePlaylist": {
             const deletePlaylistAction = action as DeletePlaylistAction;
             const playlistName = deletePlaylistAction.parameters.name;
-            const playlists = await getPlaylists(clientContext.service);
-            const playlist = playlists?.items.find((playlist) => {
-                return playlist.name
+            if (clientContext.userData === undefined) {
+                return createErrorActionResult("No user data found");
+            }
+            const playlists = await getPlaylistsFromUserData(
+                clientContext.service,
+                clientContext.userData!.data,
+            );
+            const playlist = playlists?.find((pl) => {
+                return pl.name
                     .toLowerCase()
                     .includes(playlistName.toLowerCase());
             });
             if (playlist !== undefined) {
                 await deletePlaylist(clientContext.service, playlist.id);
+                await updatePlaylists(
+                    clientContext.service,
+                    clientContext.userData!.data,
+                );
                 return createActionResultFromTextDisplay(
                     chalk.magentaBright(`playlist ${playlist.name} deleted`),
                 );
             }
             return createErrorActionResult(
                 `playlist ${playlistName} not found`,
+            );
+        }
+        case "addCurrentTrackToPlaylist": {
+            const addAction = action as AddCurrentTrackToPlaylistAction;
+            const playlistName = addAction.parameters.playlistName;
+            if (clientContext.userData === undefined) {
+                return createErrorActionResult("No user data found");
+            }
+            const playlists = await getPlaylistsFromUserData(
+                clientContext.service,
+                clientContext.userData!.data,
+            );
+            const playlist = playlists?.find((pl) => {
+                return pl.name
+                    .toLowerCase()
+                    .includes(playlistName.toLowerCase());
+            });
+            if (!playlist) {
+                return createErrorActionResult(
+                    `playlist ${playlistName} not found`,
+                );
+            }
+            const state = await getSelectedDevicePlaybackState(clientContext);
+            if (!state || !state.item || state.item.type !== "track") {
+                return createErrorActionResult("No current track playing");
+            }
+            const track = state.item as SpotifyApi.TrackObjectFull;
+            await addTracksToPlaylist(clientContext.service, playlist.id, [
+                track.uri,
+            ]);
+
+            return createActionResultFromTextDisplay(
+                chalk.magentaBright(
+                    `Added track ${track.name} to playlist ${playlist.name}`,
+                ),
             );
         }
         default:

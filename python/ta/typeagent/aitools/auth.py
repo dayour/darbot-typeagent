@@ -4,11 +4,9 @@
 
 from dataclasses import dataclass
 import time
-from typing import Any, Protocol
-import os
+from typing import Protocol
 
 from azure.identity import DefaultAzureCredential
-import dotenv
 
 
 class IAccessToken(Protocol):
@@ -56,21 +54,6 @@ def get_shared_token_provider() -> AzureTokenProvider:
     if _shared_token_provider is None:
         _shared_token_provider = AzureTokenProvider()
     return _shared_token_provider
-
-
-def load_dotenv() -> None:
-    dirname = os.path.dirname
-    here = dirname(__file__)
-    typeagent = dirname(here)
-    package = dirname(typeagent)
-    python = dirname(package)
-    repo_top = dirname(python)
-    env_path = os.path.join(repo_top, "ts", ".env")
-    dotenv.load_dotenv(env_path)
-    # for k, v in os.environ.items():
-    #     if "KEY" in k:
-    #         print(f"{k}={v!r}")
-    # print(f"Loaded {env_path}")
 
 
 if __name__ == "__main__":

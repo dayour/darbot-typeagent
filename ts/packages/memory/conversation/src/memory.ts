@@ -20,13 +20,20 @@ export interface MemorySettings {
     queryTranslator?: kp.SearchQueryTranslator | undefined;
     answerGenerator?: kp.IAnswerGenerator | undefined;
     fileSaveSettings?: IndexFileSettings | undefined;
+    /**
+     * Experimental: use improved usage of 'scopes' in queries
+     * Improved scoping leverages Structured Tags
+     * @see {kp.searchConversationWithLanguage2}
+     */
+    useScopedSearch?: boolean | undefined;
 }
 
 export function createMemorySettings(
     embeddingCacheSize = 64,
     getPersistentCache?: () => TextEmbeddingCache | undefined,
+    languageModel?: ChatModel,
 ): MemorySettings {
-    const languageModel = openai.createChatModelDefault("conversation-memory");
+    languageModel ??= openai.createChatModelDefault("conversation-memory");
     /**
      * Our index already has embeddings for every term in the podcast
      * Create a caching embedding model that can just leverage those embeddings
@@ -55,8 +62,18 @@ export function createMemorySettings(
     return memorySettings;
 }
 
+/**
+ * Settings for how memory index file are stored
+ */
 export type IndexFileSettings = {
+    /**
+     * Directory that contains memory files
+     */
     dirPath: string;
+    /**
+     * Base filename for memory files
+     * Specific filenames used to persist memory use this as a prefix
+     */
     baseFileName: string;
 };
 
@@ -119,24 +136,31 @@ export class MessageMetadata
 
 /**
  * A Message in a Memory {@link Memory}
+ * Message implements {@link kp.IMessage}
  */
 export class Message<TMeta extends MessageMetadata = MessageMetadata>
     implements kp.IMessage
 {
+    /**
+     * Text chunk associated with this messages
+     */
     public textChunks: string[];
 
     constructor(
+        /**
+         * {@link MessageMetadata}
+         */
         public metadata: TMeta,
-        messageBody: string | string[],
-        public tags: string[] = [],
+        textChunks: string | string[],
+        public tags: kp.MessageTag[] = [],
         public timestamp: string | undefined = undefined,
         public knowledge: kpLib.KnowledgeResponse | undefined = undefined,
         public deletionInfo: kp.DeletionInfo | undefined = undefined,
     ) {
-        if (Array.isArray(messageBody)) {
-            this.textChunks = messageBody;
+        if (Array.isArray(textChunks)) {
+            this.textChunks = textChunks;
         } else {
-            this.textChunks = [messageBody];
+            this.textChunks = [textChunks];
         }
     }
 
@@ -155,7 +179,7 @@ export class Message<TMeta extends MessageMetadata = MessageMetadata>
         newKnowledge: kpLib.KnowledgeResponse,
     ): kpLib.KnowledgeResponse {
         if (this.knowledge !== undefined) {
-            this.knowledge.entities = kp.mergeConcreteEntities([
+            this.knowledge.entities = this.mergeEntities([
                 ...this.knowledge.entities,
                 ...newKnowledge.entities,
             ]);
@@ -183,7 +207,7 @@ export class Message<TMeta extends MessageMetadata = MessageMetadata>
             ...this.knowledge,
         };
         combinedKnowledge.entities.push(...metaKnowledge.entities);
-        combinedKnowledge.entities = kp.mergeConcreteEntities(
+        combinedKnowledge.entities = this.mergeEntities(
             combinedKnowledge.entities,
         );
         combinedKnowledge.topics.push(...metaKnowledge.topics);
@@ -193,15 +217,15 @@ export class Message<TMeta extends MessageMetadata = MessageMetadata>
         combinedKnowledge.inverseActions.push(...metaKnowledge.inverseActions);
         return combinedKnowledge;
     }
-}
 
-/**
- * A
- */
-export type MemoryFilter = {
-    knowledgeType?: kp.KnowledgeType | undefined;
-    tag?: string | string[];
-};
+    private mergeEntities(
+        entities: kpLib.ConcreteEntity[],
+    ): kpLib.ConcreteEntity[] {
+        // TODO: using mergeConcreteEntitiesEx to avoid forcing the data to be lower case.
+        // Replace with mergeConcreteEntities once it has switch over to the Ex version.
+        return kp.mergeConcreteEntitiesEx(entities);
+    }
+}
 
 /**
  * A memory containing a sequence of messages {@link Message}
@@ -270,8 +294,91 @@ export abstract class Memory<
         );
     }
 
+    /**
+     * Find matching topics in this conversation
+     * Wrapper around the more powerful searchKnowledge
+     * @param searchTerms
+     * @param topK
+     * @param exactMatch
+     * @returns
+     */
+    public async searchTopics(
+        searchTerms: string | string[],
+        topK?: number,
+        exactMatch: boolean = false,
+    ): Promise<kp.Topic[] | undefined> {
+        const searchTermGroup = kp.createTopicSearchTermGroup(
+            searchTerms,
+            exactMatch,
+        );
+        const matches = await this.searchKnowledge({
+            searchTermGroup,
+            when: { knowledgeType: "topic" },
+        });
+        const topicMatches = matches?.get("topic");
+        if (!topicMatches || topicMatches.semanticRefMatches.length === 0) {
+            return undefined;
+        }
+        /**
+         * Search will find every matching instance of the occurrence of a topic during the conversation
+         * Since we are only interested in the topics themselves,return a distinct list
+         */
+        const distinct = kp.getDistinctTopicMatches(
+            this.conversation.semanticRefs!,
+            topicMatches.semanticRefMatches,
+            topK,
+        );
+        return distinct.map((t) => t.knowledge as kp.Topic);
+    }
+
+    /**
+     * Find matching entities in this conversation
+     * Wrapper around the more powerful searchKnowledge
+     * @param name (Optional) entity name to match
+     * @param type (Optional) entity type to match
+     * @param facetName (Optional) facet name to match
+     * @param facetValue (Optional) facet value  to match
+     * @param topK
+     * @param exactMatch
+     * @returns
+     */
+    public async searchEntities(
+        name: string | undefined,
+        type?: string | undefined,
+        facetName?: string | undefined,
+        facetValue?: string | undefined,
+        topK?: number,
+        exactMatch: boolean = false,
+    ): Promise<kpLib.ConcreteEntity[] | undefined> {
+        const searchTermGroup = kp.createEntitySearchTermGroup(
+            name,
+            type,
+            facetName,
+            facetValue,
+            exactMatch,
+        );
+        const matches = await this.searchKnowledge({
+            searchTermGroup,
+            when: { knowledgeType: "entity" },
+        });
+        const entityMatches = matches?.get("entity");
+        if (!entityMatches || entityMatches.semanticRefMatches.length === 0) {
+            return undefined;
+        }
+
+        const distinct = kp.getDistinctEntityMatches(
+            this.conversation.semanticRefs!,
+            entityMatches.semanticRefMatches,
+            topK,
+        );
+        return distinct.map((t) => t.knowledge as kpLib.ConcreteEntity);
+    }
+
     /***
      * Run a natural language query against this memory.
+     * Natural language is translated to knowpro {@link kp.SearchSelectExpr | search expressions}
+     * These expressions are used to search memory, which returns knowledge and messages relevant to the query.
+     * Knowledge and messages are scored for relevance.
      * @param {string} searchText - The natural language query text.
      * @param {kp.LanguageSearchOptions} [options] - Optional search options.
      * @param {kp.LanguageSearchDebugContext} [debugContext] - Optional debug context.
@@ -284,14 +391,76 @@ export abstract class Memory<
         debugContext?: kp.LanguageSearchDebugContext,
     ): Promise<Result<kp.ConversationSearchResult[]>> {
         options = this.adjustLanguageSearchOptions(options);
-        return kp.searchConversationWithLanguage(
-            this.conversation,
-            searchText,
-            this.getQueryTranslator(),
-            options,
-            langSearchFilter,
-            debugContext,
-        );
+        if (!this.useScoped) {
+            return kp.searchConversationWithLanguage(
+                this.conversation,
+                searchText,
+                this.getQueryTranslator(),
+                options,
+                langSearchFilter,
+                debugContext,
+            );
+        } else {
+            return kp.searchConversationWithLanguage2(
+                this.conversation,
+                searchText,
+                this.getQueryTranslator(),
+                options,
+                langSearchFilter,
+                debugContext,
+            );
+        }
+    }
+
+    /**
+     * Run a query on the memory using topics
+     * Simple wrapper around {@link search}
+     * @param topicTerms
+     * @param {kp.WhenFilter} when
+     * @param {kp.SearchOptions} options
+     * @returns {kp.ConversationSearchResult}
+     */
+    public async searchWithTopics(
+        topicTerms: string | string[],
+        when?: kp.WhenFilter,
+        options?: kp.SearchOptions,
+    ): Promise<kp.ConversationSearchResult | undefined> {
+        const selectExpr: kp.SearchSelectExpr = {
+            searchTermGroup: kp.createTopicSearchTermGroup(topicTerms),
+            when,
+        };
+        return this.search(selectExpr, options);
+    }
+
+    /**
+     * Run a query on the memory using entity matching
+     * Simple wrapper around {@link search}
+     * @param name (Optional) entity name to match
+     * @param type (Optional) entity type to match
+     * @param facetName (Optional) facet name to match
+     * @param facetValue (Optional) facet value  to match
+     * @param {kp.WhenFilter} when (Optional) Scoping filter
+     * @param {kp.SearchOptions} options
+     * @returns
+     */
+    public async searchWithEntities(
+        name: string | undefined,
+        type?: string | undefined,
+        facetName?: string | undefined,
+        facetValue?: string | undefined,
+        when?: kp.WhenFilter,
+        options?: kp.SearchOptions,
+    ): Promise<kp.ConversationSearchResult | undefined> {
+        const selectExpr: kp.SearchSelectExpr = {
+            searchTermGroup: kp.createEntitySearchTermGroup(
+                name,
+                type,
+                facetName,
+                facetValue,
+            ),
+            when,
+        };
+        return this.search(selectExpr, options);
     }
 
     /**
@@ -305,20 +474,35 @@ export abstract class Memory<
         options?: kp.LanguageSearchOptions,
     ): Promise<Result<kp.querySchema.SearchQuery>> {
         options = this.adjustLanguageSearchOptions(options);
-        return kp.searchQueryFromLanguage(
-            this.conversation,
-            this.getQueryTranslator(),
-            searchText,
-            this.getModelInstructions(),
-        );
+        if (!this.useScoped) {
+            return kp.searchQueryFromLanguage(
+                this.conversation,
+                this.getQueryTranslator(),
+                searchText,
+                this.getModelInstructions(),
+            );
+        } else {
+            return kp.searchQueryFromLanguage2(
+                this.conversation,
+                this.getQueryTranslator(),
+                searchText,
+                this.getModelInstructions(),
+            );
+        }
     }
 
     /**
-     * Get an answer from a natural language question.
+     * Get an answer from a natural language question. The returned result object will indicate success or failure.  
+     * If the returned result is a success:
+     * - A single question can be turned into multiple search queries, although most single phrase questions are a single query.
+     * - The result is a tuple of (a) Raw search results (b) The natural language answer generated from the search results.
+     * @see kp.AnswerResponse. 
+     * - If the question was answered, the response {@link kp.AnswerType} will be "Answered". Else "NoAnswer" and a reason is provided in {@link kp.AnswerResponse.whyNoAnswer}
+     
      * @param {string} question - The natural language question.
      * @param {kp.LanguageSearchOptions} [searchOptions] - Optional search options.
      * @param progress - Optional progress callback.
-     * @returns {Promise<Result<[kp.ConversationSearchResult, kp.AnswerResponse][]>>} - Search Results and the answers generated for them.
+     * @returns {Promise<Result<[kp.ConversationSearchResult, kp.AnswerResponse][]>>} Tuple: [Raw Search Results, Answers generated using Search Results].
      */
     public async getAnswerFromLanguage(
         question: string,
@@ -415,6 +599,22 @@ export abstract class Memory<
         return undefined;
     }
 
+    protected addStandardNoiseTerms() {
+        addNoiseWordsFromFile(
+            this.noiseTerms,
+            ms.getAbsolutePathFromUrl(import.meta.url, "noiseTerms.txt"),
+        );
+    }
+
+    protected ensureAnswerGenerator(): kp.IAnswerGenerator {
+        if (this.settings.answerGenerator === undefined) {
+            this.settings.answerGenerator = new kp.AnswerGenerator(
+                kp.createAnswerGeneratorSettings(this.settings.languageModel),
+            );
+        }
+        return this.settings.answerGenerator;
+    }
+
     private getQueryTranslator(): kp.SearchQueryTranslator {
         const queryTranslator = this.settings.queryTranslator;
         if (!queryTranslator) {
@@ -438,19 +638,23 @@ export abstract class Memory<
         return options;
     }
 
-    protected addStandardNoiseTerms() {
-        addNoiseWordsFromFile(
-            this.noiseTerms,
-            ms.getAbsolutePathFromUrl(import.meta.url, "noiseTerms.txt"),
-        );
+    private get useScoped(): boolean {
+        return this.settings.useScopedSearch ?? false;
     }
+}
 
-    protected ensureAnswerGenerator(): kp.IAnswerGenerator {
-        if (this.settings.answerGenerator === undefined) {
-            this.settings.answerGenerator = new kp.AnswerGenerator(
-                kp.createAnswerGeneratorSettings(this.settings.languageModel),
-            );
-        }
-        return this.settings.answerGenerator;
-    }
+/**
+ * Create settings for text memory.
+ * @param embeddingCacheSize Default size of the embedding cache.
+ * @param getPersistentCache Function to retrieve the persistent cache.
+ * @returns Memory settings object.
+ */
+
+export function createTextMemorySettings(
+    embeddingCacheSize = 64,
+    getPersistentCache?: () => TextEmbeddingCache | undefined,
+) {
+    return {
+        ...createMemorySettings(embeddingCacheSize, getPersistentCache),
+    };
 }

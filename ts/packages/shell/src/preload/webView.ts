@@ -2,12 +2,46 @@
 // Licensed under the MIT License.
 
 const { contextBridge } = require("electron/renderer");
-const { webFrame } = require("electron");
 
-import DOMPurify from "dompurify";
 import { ipcRenderer } from "electron";
 import registerDebug from "debug";
+import {
+    setupInlineBrowserRendererProxy,
+    sendScriptAction,
+} from "./inlineBrowserRendererRpcServer";
+import { ElectronPDFInterceptor } from "./pdfInterceptor";
+
 const debugWebAgentProxy = registerDebug("typeagent:webAgent:proxy");
+
+// Import progress callback registry
+const importProgressCallbacks = new Map<string, (progress: any) => void>();
+
+// Track the currently active tab ID from main process
+let currentActiveTabId: string | null = null;
+
+// Get tab context for automation routing
+function getTabContext(): string | null {
+    return (window as any)._tabId || null;
+}
+
+// Validate that this tab is the active tab for automation actions
+function isActiveTab(): boolean {
+    const tabId = getTabContext();
+    if (!tabId) {
+        return false;
+    }
+
+    if (currentActiveTabId === null) {
+        return true;
+    }
+
+    return tabId === currentActiveTabId;
+}
+
+// Listen for tab state updates from main process
+ipcRenderer.on("browser-tabs-updated", (_, tabsData) => {
+    currentActiveTabId = tabsData.activeTabId;
+});
 
 ipcRenderer.on("received-from-browser-ipc", async (_, data) => {
     if (data.error) {
@@ -15,29 +49,44 @@ ipcRenderer.on("received-from-browser-ipc", async (_, data) => {
         return;
     }
 
+    // Handle import progress messages
+    if (data.method === "importProgress") {
+        if (data.params && data.params.importId) {
+            const callback = importProgressCallbacks.get(data.params.importId);
+            if (callback) {
+                callback({
+                    type: "importProgress",
+                    importId: data.params.importId,
+                    progress: data.params.progress,
+                });
+            }
+        }
+        return;
+    }
+
     if (data.method !== undefined && data.method.indexOf("/") > 0) {
         const [schema, actionName] = data.method?.split("/");
 
         if (schema === "browser") {
-            if (actionName == "siteTranslatorStatus") {
-                if (data.body.status == "initializing") {
-                    console.log(`Initializing ${data.body.translator}`);
-                } else if (data.body.status == "initialized") {
-                    console.log(
-                        `Finished initializing ${data.body.translator}`,
-                    );
-                }
-            } else {
-                const response = await runBrowserAction({
-                    actionName: actionName,
-                    parameters: data.params,
-                });
-
+            // Validate tab context for automation actions
+            const tabId = getTabContext();
+            if (tabId && !isActiveTab()) {
                 sendToBrowserAgent({
                     id: data.id,
-                    result: response,
+                    error: `Action ${actionName} blocked: not active tab (${tabId})`,
                 });
+                return;
             }
+
+            const response = await runBrowserAction({
+                actionName: actionName,
+                parameters: data.params,
+            });
+
+            sendToBrowserAgent({
+                id: data.id,
+                result: response,
+            });
         } else if (schema.startsWith("browser.")) {
             const message = await runSiteAction(schema, {
                 actionName: actionName,
@@ -59,6 +108,15 @@ ipcRenderer.on("received-from-browser-ipc", async (_, data) => {
     }
 });
 
+// Set up inline browser renderer RPC proxy
+setupInlineBrowserRendererProxy();
+
+// Initialize PDF interceptor when DOM is ready
+document.addEventListener("DOMContentLoaded", () => {
+    const pdfInterceptor = new ElectronPDFInterceptor();
+    pdfInterceptor.initialize();
+});
+
 function sendToBrowserAgent(message: any) {
     ipcRenderer.send("send-to-browser-ipc", message);
 }
@@ -67,9 +125,24 @@ export async function awaitPageLoad() {
     /*
     return new Promise<string | undefined>((resolve, reject) => {
         // use window API to await pageload
-        
+
     });
     */
+}
+
+export async function awaitPageIncrementalLoad(): Promise<boolean> {
+    try {
+        const result = await sendScriptAction(
+            {
+                type: "await_page_incremental_load",
+            },
+            5000,
+        );
+        return result === "true";
+    } catch (error) {
+        console.error("Content script page load detection failed:", error);
+        return true; // fallback - assume page is ready
+    }
 }
 
 export async function getTabHTMLFragments(
@@ -86,7 +159,7 @@ export async function getTabHTMLFragments(
                 fullSize: fullSize,
                 frameId: 0,
             },
-            50000,
+            5000,
             window.top,
             "0",
         ),
@@ -112,7 +185,7 @@ export async function getTabHTMLFragments(
                     fullSize: fullSize,
                     frameId: index,
                 },
-                50000,
+                5000,
                 frameElement.contentWindow,
                 index.toString(),
             ),
@@ -125,15 +198,31 @@ export async function getTabHTMLFragments(
         if (frameHTML) {
             let frameText = "";
             if (extractText) {
-                frameText = await sendScriptAction(
-                    {
-                        type: "get_page_text",
-                        inputHtml: frameHTML,
-                        frameId: i,
-                    },
-                    1000,
-                    frames[i],
-                );
+                if (i == 0) {
+                    frameText = await sendScriptAction(
+                        {
+                            type: "get_page_text",
+                            inputHtml: frameHTML,
+                            frameId: 0,
+                        },
+                        1000,
+                        window.top,
+                        "0",
+                    );
+                } else {
+                    const index = i - 1;
+                    const frameElement = iframeElements[index];
+                    frameText = await sendScriptAction(
+                        {
+                            type: "get_page_text",
+                            inputHtml: frameHTML,
+                            frameId: index,
+                        },
+                        1000,
+                        frameElement.contentWindow,
+                        index.toString(),
+                    );
+                }
             }
 
             htmlFragments.push({
@@ -145,61 +234,6 @@ export async function getTabHTMLFragments(
     }
 
     return htmlFragments;
-}
-
-export async function sendScriptAction(
-    body: any,
-    timeout?: number,
-    frameWindow?: Window | null,
-    idPrefix?: string,
-) {
-    const timeoutPromise = new Promise((f) => setTimeout(f, timeout));
-
-    const targetWindow = frameWindow ?? window;
-
-    const actionPromise = new Promise<any | undefined>((resolve) => {
-        let callId = new Date().getTime().toString();
-        if (idPrefix) {
-            callId = idPrefix + "_" + callId;
-        }
-
-        targetWindow.postMessage(
-            {
-                source: "preload",
-                target: "contentScript",
-                messageType: "scriptActionRequest",
-                id: callId,
-                body: body,
-            },
-            "*",
-        );
-
-        // if timeout is provided, wait for a response - otherwise fire and forget
-        if (timeout) {
-            const handler = (event: any) => {
-                if (
-                    event.data.target == "preload" &&
-                    event.data.source == "contentScript" &&
-                    event.data.messageType == "scriptActionResponse" &&
-                    event.data.id == callId &&
-                    event.data.body
-                ) {
-                    window.removeEventListener("message", handler);
-                    resolve(event.data.body);
-                }
-            };
-
-            window.addEventListener("message", handler, false);
-        } else {
-            resolve(undefined);
-        }
-    });
-
-    if (timeout) {
-        return Promise.race([actionPromise, timeoutPromise]);
-    } else {
-        return actionPromise;
-    }
 }
 
 export async function sendScriptActionToAllFrames(body: any, timeout?: number) {
@@ -221,80 +255,6 @@ async function runBrowserAction(action: any) {
     const actionName =
         action.actionName ?? action.fullActionName.split(".").at(-1);
     switch (actionName) {
-        case "followLinkByText": {
-            const response = await sendScriptAction(
-                {
-                    type: "get_page_links_by_query",
-                    query: action.parameters.keywords,
-                },
-                5000,
-            );
-            console.log("We should navigate to " + JSON.stringify(response));
-
-            if (response && response.url) {
-                const sanitizedUrl = DOMPurify.sanitize(response.url);
-                window.location.href = sanitizedUrl;
-                confirmationMessage = `Navigated to the  ${action.parameters.keywords} link`;
-            }
-
-            break;
-        }
-
-        case "scrollDown": {
-            sendScriptAction({
-                type: "scroll_down_on_page",
-            });
-            break;
-        }
-        case "scrollUp": {
-            sendScriptAction({
-                type: "scroll_up_on_page",
-            });
-            break;
-        }
-        case "goBack": {
-            sendScriptAction({
-                type: "history_go_back",
-            });
-            break;
-        }
-        case "goForward": {
-            sendScriptAction({
-                type: "history_go_forward",
-            });
-            break;
-        }
-
-        case "zoomIn": {
-            if (window.location.href.startsWith("https://paleobiodb.org/")) {
-                sendScriptAction({
-                    type: "run_paleoBioDb_action",
-                    action: action,
-                });
-            } else {
-                const currZoom = webFrame.getZoomFactor();
-                webFrame.setZoomFactor(currZoom + 0.2);
-            }
-
-            break;
-        }
-        case "zoomOut": {
-            if (window.location.href.startsWith("https://paleobiodb.org/")) {
-                sendScriptAction({
-                    type: "run_paleoBioDb_action",
-                    action: action,
-                });
-            } else {
-                const currZoom = webFrame.getZoomFactor();
-                webFrame.setZoomFactor(currZoom - 0.2);
-            }
-            break;
-        }
-        case "zoomReset": {
-            webFrame.setZoomFactor(1.0);
-            break;
-        }
-
         case "getHTML": {
             responseObject = await getTabHTMLFragments(
                 action.parameters.fullHTML,
@@ -313,46 +273,9 @@ async function runBrowserAction(action: any) {
             });
             break;
         }
-        case "getPageUrl": {
-            responseObject = window.location.href;
-            break;
-        }
-        case "getPageSchema": {
-            responseObject = await sendScriptAction(
-                {
-                    type: "get_page_schema",
-                },
-                1000,
-            );
 
-            break;
-        }
-        case "setPageSchema": {
-            sendScriptAction({
-                type: "set_page_schema",
-                action: action,
-            });
-            break;
-        }
-        case "clearPageSchema": {
-            sendScriptAction({
-                type: "clear_page_schema",
-            });
-            break;
-        }
-        case "reloadPage": {
-            sendScriptAction({
-                type: "clear_page_schema",
-            });
-            location.reload();
-            break;
-        }
-        case "closeWindow": {
-            window.close();
-            // todo: call method on IPC process to close the window/view
-
-            break;
-        }
+        default:
+            throw new Error(`Invalid action: ${actionName}`);
     }
 
     return {
@@ -403,6 +326,73 @@ contextBridge.exposeInMainWorld("browserConnect", {
                 params: { translator: schemaName },
             });
         }
+    },
+    // Expose HTML fragment extraction functions for inline browser control
+    runBrowserAction: runBrowserAction,
+    getTabHTMLFragments: getTabHTMLFragments,
+});
+
+// Add extension service adapter API for view pages
+contextBridge.exposeInMainWorld("electronAPI", {
+    // Extension service adapter API
+    sendBrowserMessage: async (message: any) => {
+        return ipcRenderer.invoke("browser-extension-message", message);
+    },
+
+    // Storage API using main process persistence
+    getStorage: async (keys: string[]) => {
+        try {
+            return await ipcRenderer.invoke("extension-storage-get", keys);
+        } catch (error) {
+            console.error("Failed to get storage:", error);
+            return {};
+        }
+    },
+
+    setStorage: async (items: Record<string, any>) => {
+        try {
+            const result = await ipcRenderer.invoke(
+                "extension-storage-set",
+                items,
+            );
+            if (!result.success) {
+                throw new Error(result.error || "Failed to set storage");
+            }
+        } catch (error) {
+            console.error("Failed to set storage:", error);
+            throw error;
+        }
+    },
+
+    // Direct WebSocket connection check
+    checkWebSocketConnection: async () => {
+        return ipcRenderer.invoke("check-websocket-connection");
+    },
+
+    // Import progress API
+    onImportProgress: (callback: (event: any) => void) => {
+        // Store callback with a unique key (since we can't directly get importId here)
+        // We'll use a global callback that filters by importId in the ElectronExtensionService
+        const wrappedCallback = (progress: any) => {
+            callback(progress);
+        };
+
+        // For Electron, we'll register a global progress listener
+        // The ElectronExtensionService will filter by importId
+        (window as any)._electronProgressCallback = wrappedCallback;
+    },
+
+    // Register progress callback for specific import
+    registerImportProgressCallback: (
+        importId: string,
+        callback: (progress: any) => void,
+    ) => {
+        importProgressCallbacks.set(importId, callback);
+    },
+
+    // Unregister progress callback for specific import
+    unregisterImportProgressCallback: (importId: string) => {
+        importProgressCallbacks.delete(importId);
     },
 });
 

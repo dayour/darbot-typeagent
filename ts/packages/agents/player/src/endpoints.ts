@@ -6,8 +6,9 @@ import registerDebug from "debug";
 import { createFetchError } from "./utils.js";
 
 const debugSpotifyRest = registerDebug("typeagent:spotify:rest");
+const debugSpotifyRestVerbose = registerDebug("typeagent:spotify-verbose:rest");
 
-export const limitMax = 50;
+const limitMax = 50;
 
 export async function search(
     query: SpotifyApi.SearchForItemParameterObject,
@@ -26,8 +27,18 @@ async function getK<T>(
         count: number,
         offset: number,
     ) => Promise<SpotifyApi.PagingObject<T> | undefined>,
+    ignoreError: boolean,
 ): Promise<T[] | undefined> {
-    let data = await get(Math.min(k, limitMax), 0);
+    const getOnce = ignoreError
+        ? async (count: number, offset: number) => {
+              try {
+                  return await get(count, offset);
+              } catch (e: any) {
+                  return null;
+              }
+          }
+        : get;
+    const data = await getOnce(Math.min(k, limitMax), 0);
     if (!data || data.items.length === 0) {
         return undefined;
     }
@@ -35,18 +46,30 @@ async function getK<T>(
     if (k <= limitMax) {
         return results;
     }
+
+    let total = data.total;
+    let offset = limitMax;
     while (results.length < k) {
-        const offset = results.length;
-        if (offset >= data.total) {
+        if (offset >= total) {
             break;
         }
-        data = await get(Math.min(k - results.length, limitMax), offset);
+        const count = Math.min(k - results.length, limitMax);
+        const data = await getOnce(count, offset);
+
+        if (data === null) {
+            // ignore error and continue;
+            offset += count;
+            continue;
+        }
         if (!data || data.items.length === 0) {
             return undefined;
         }
         results.push(...data.items);
+        total = data.total;
+        offset = data.offset + data.items.length;
     }
-    return results;
+
+    return results.length > 0 ? results : undefined;
 }
 
 async function callFetch<T>(
@@ -109,6 +132,7 @@ async function callFetch<T>(
                     case 200:
                     case 201:
                         const content = await result.text();
+                        debugSpotifyRestVerbose("Response content:", content);
                         if (content === "") {
                             return {} as T;
                         }
@@ -176,7 +200,11 @@ async function fetchDelete<T>(
     return callFetch<T>(service, "DELETE", restUrl, undefined, 200);
 }
 
-export async function getFavoriteAlbums(service: SpotifyService, k = limitMax) {
+export async function getFavoriteAlbums(
+    service: SpotifyService,
+    k = limitMax,
+    ignoreError: boolean = false,
+) {
     const get = async (limit: number, offset: number) =>
         fetchGet<SpotifyApi.UsersSavedAlbumsResponse>(
             service,
@@ -186,10 +214,14 @@ export async function getFavoriteAlbums(service: SpotifyService, k = limitMax) {
                 offset,
             },
         );
-    return getK(k, get);
+    return getK(k, get, ignoreError);
 }
 
-export async function getFavoriteTracks(service: SpotifyService, k = limitMax) {
+export async function getFavoriteTracks(
+    service: SpotifyService,
+    k = limitMax,
+    ignoreError: boolean = false,
+) {
     const get = async (limit: number, offset: number) =>
         fetchGet<SpotifyApi.UsersSavedTracksResponse>(
             service,
@@ -199,10 +231,14 @@ export async function getFavoriteTracks(service: SpotifyService, k = limitMax) {
                 offset,
             },
         );
-    return getK(k, get);
+    return getK(k, get, ignoreError);
 }
 
-export async function getTopUserArtists(service: SpotifyService, k = limitMax) {
+export async function getTopUserArtists(
+    service: SpotifyService,
+    k = limitMax,
+    ignoreError: boolean = false,
+) {
     const get = async (limit: number, offset: number) =>
         fetchGet<SpotifyApi.UsersTopArtistsResponse>(
             service,
@@ -212,10 +248,14 @@ export async function getTopUserArtists(service: SpotifyService, k = limitMax) {
                 offset,
             },
         );
-    return getK(k, get);
+    return getK(k, get, ignoreError);
 }
 
-export async function getTopUserTracks(service: SpotifyService, k = limitMax) {
+export async function getTopUserTracks(
+    service: SpotifyService,
+    k = limitMax,
+    ignoreError: boolean = false,
+) {
     const get = async (limit: number, offset: number) =>
         fetchGet<SpotifyApi.UsersTopTracksResponse>(
             service,
@@ -225,7 +265,8 @@ export async function getTopUserTracks(service: SpotifyService, k = limitMax) {
                 offset,
             },
         );
-    return getK(k, get);
+
+    return getK(k, get, ignoreError);
 }
 
 async function getKCursor<T>(
@@ -234,8 +275,18 @@ async function getKCursor<T>(
         count: number,
         after: string | undefined,
     ) => Promise<SpotifyApi.CursorBasedPagingObject<T> | undefined>,
+    ignoreError: boolean,
 ): Promise<T[] | undefined> {
-    let data = await get(Math.min(k, limitMax), undefined);
+    const getOnce = ignoreError
+        ? async (count: number, after: string | undefined) => {
+              try {
+                  return await get(count, after);
+              } catch (e: any) {
+                  return null;
+              }
+          }
+        : get;
+    let data = await getOnce(Math.min(k, limitMax), undefined);
     if (!data || data.items.length === 0) {
         return undefined;
     }
@@ -248,7 +299,11 @@ async function getKCursor<T>(
         if (after === null) {
             break;
         }
-        data = await get(Math.min(k - results.length, limitMax), after);
+        data = await getOnce(Math.min(k - results.length, limitMax), after);
+        if (data === null) {
+            // Ignore error and return what is available so far.
+            break;
+        }
         if (!data || data.items.length === 0) {
             return undefined;
         }
@@ -260,6 +315,7 @@ async function getKCursor<T>(
 export async function getFollowedArtists(
     service: SpotifyService,
     k = limitMax,
+    ignoreError: boolean = false,
 ) {
     const get = async (limit: number, after: string | undefined) => {
         const param: any = {
@@ -278,10 +334,14 @@ export async function getFollowedArtists(
         return response?.artists;
     };
 
-    return getKCursor(k, get);
+    return getKCursor(k, get, ignoreError);
 }
 
-export async function getRecentlyPlayed(service: SpotifyService, k = limitMax) {
+export async function getRecentlyPlayed(
+    service: SpotifyService,
+    k = limitMax,
+    ignoreError: boolean = false,
+) {
     const get = async (limit: number, after: string | undefined) =>
         fetchGet<SpotifyApi.UsersRecentlyPlayedTracksResponse>(
             service,
@@ -293,7 +353,7 @@ export async function getRecentlyPlayed(service: SpotifyService, k = limitMax) {
                   }
                 : { limit },
         );
-    return getKCursor(limitMax, get);
+    return getKCursor(k, get, ignoreError);
 }
 
 export async function getArtist(service: SpotifyService, id: string) {
@@ -370,7 +430,7 @@ export async function play(
     await fetchPutEmptyResult(service, playUrl, smallTrack);
 }
 
-export async function getDevices(service: SpotifyService) {
+export async function getUserDevices(service: SpotifyService) {
     return fetchGet<SpotifyApi.UserDevicesResponse>(
         service,
         "https://api.spotify.com/v1/me/player/devices",
@@ -417,6 +477,16 @@ export async function next(service: SpotifyService, deviceId: string) {
         service,
         `https://api.spotify.com/v1/me/player/next?device_id=${deviceId}`,
     );
+}
+
+export async function followPlaylist(
+    service: SpotifyService,
+    playlistId: string,
+) {
+    const url = `https://api.spotify.com/v1/playlists/${encodeURIComponent(
+        playlistId,
+    )}/followers`;
+    return fetchPutEmptyResult(service, url);
 }
 
 export async function getPlaylists(service: SpotifyService) {
@@ -494,6 +564,61 @@ export async function getTracksFromIds(
     return trackResponses;
 }
 
+// get recommendations based on seed tracks, artists or genres
+export async function getRecommendations(
+    service: SpotifyService,
+    params: SpotifyApi.RecommendationsOptionsObject,
+) {
+    return fetchGet<SpotifyApi.RecommendationsFromSeedsResponse>(
+        service,
+        "https://api.spotify.com/v1/recommendations",
+        params,
+    );
+}
+
+export async function getRecommendationsFromTracks(
+    service: SpotifyService,
+    trackIds: string[],
+    limit = 20,
+) {
+    const seedTracks = trackIds.slice(0, 5);
+    return getRecommendations(service, { seed_tracks: seedTracks, limit });
+}
+
+export async function getRecommendationsFromTrackCollection(
+    service: SpotifyService,
+    trackCollection: { getTracks(): SpotifyApi.TrackObjectFull[] },
+    startIndex = 0,
+    limit = 20,
+) {
+    const seedTracks = trackCollection
+        .getTracks()
+        .slice(startIndex, startIndex + 5)
+        .map((track) => track.id);
+    return getRecommendations(service, { seed_tracks: seedTracks, limit });
+}
+
+export async function getRecommendationsFromArtists(
+    service: SpotifyService,
+    artistIds: string[],
+    limit = 20,
+) {
+    const seedArtists = artistIds.slice(0, 5);
+    return getRecommendations(service, { seed_artists: seedArtists, limit });
+}
+
+export async function addTracksToPlaylist(
+    service: SpotifyService,
+    playlistId: string,
+    trackUris: string[],
+) {
+    return fetchPost<SpotifyApi.AddTracksToPlaylistResponse>(
+        service,
+        `https://api.spotify.com/v1/playlists/${encodeURIComponent(playlistId)}/tracks`,
+        { uris: trackUris },
+    );
+}
+
 export async function getPlaylistTracks(
     service: SpotifyService,
     playlistId: string,
@@ -532,10 +657,14 @@ export async function createPlaylist(
     );
 }
 
-export async function setVolume(service: SpotifyService, amt = limitMax) {
+export async function setVolume(
+    service: SpotifyService,
+    deviceId: string,
+    amt: number,
+) {
     const volumeUrl = getUrlWithParams(
         "https://api.spotify.com/v1/me/player/volume?volume_percent",
-        { volume_percent: amt },
+        { volume_percent: amt, device_id: deviceId },
     );
     return fetchPutEmptyResult(service, volumeUrl);
 }

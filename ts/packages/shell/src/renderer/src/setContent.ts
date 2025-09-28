@@ -13,11 +13,14 @@ import DOMPurify from "dompurify";
 import { SettingsView } from "./settingsView";
 import MarkdownIt from "markdown-it";
 
-const ansi_up = new AnsiUp();
-ansi_up.use_classes = true;
+const ansiUpTextToHtml = new AnsiUp();
+ansiUpTextToHtml.use_classes = true;
+const ansiUpMarkdownToHtml = new AnsiUp();
+ansiUpMarkdownToHtml.use_classes = true;
+ansiUpMarkdownToHtml.escape_html = false;
 
 function textToHtml(text: string): string {
-    const value = ansi_up.ansi_to_html(text);
+    const value = ansiUpTextToHtml.ansi_to_html(text);
     const line = value.replace(/\n/gm, "<br>");
     return line;
 }
@@ -44,13 +47,28 @@ function processContent(
             return content;
         case "html":
             return DOMPurify.sanitize(content, {
-                ADD_ATTR: ["target", "onclick", "onerror"],
+                ADD_ATTR: ["target", "onclick", "onerror", "href"],
                 ADD_DATA_URI_TAGS: ["img"],
-                ADD_URI_SAFE_ATTR: ["src"],
+                ADD_URI_SAFE_ATTR: ["src", "href"],
+                ALLOWED_URI_REGEXP:
+                    /^(?:(?:(?:f|ht)tps?|mailto|tel|callto|cid|xmpp|typeagent-browser):|[^a-z]|[a-z+.\-]+(?:[^a-z+.\-:]|$))/i,
             });
         case "markdown":
             const md = new MarkdownIt();
-            return inline ? md.renderInline(content) : md.render(content);
+            // Links in the chat windows should open in a new tab.
+            const defaultRender =
+                md.renderer.rules.link_open ||
+                function (tokens, idx, options, _env, self) {
+                    return self.renderToken(tokens, idx, options);
+                };
+            md.renderer.rules.link_open = (tokens, idx, ...args) => {
+                tokens[idx].attrSet("target", "_blank");
+                return defaultRender(tokens, idx, ...args);
+            };
+
+            return ansiUpMarkdownToHtml.ansi_to_html(
+                inline ? md.renderInline(content) : md.render(content),
+            );
         case "text":
             return enableText2Html
                 ? textToHtml(content)
@@ -212,6 +230,26 @@ export function setContent(
     } else {
         // vanilla, sanitized HTML only
         contentElm.innerHTML += contentHtml;
+
+        // Add click handlers for all links to open in browser tabs
+        const allLinks = contentElm.querySelectorAll("a[href]");
+        allLinks.forEach((link) => {
+            const href = link.getAttribute("href");
+            if (
+                href &&
+                (href.startsWith("typeagent-browser://") ||
+                    href.startsWith("http://") ||
+                    href.startsWith("https://"))
+            ) {
+                link.addEventListener("click", (e) => {
+                    e.preventDefault(); // Prevent default navigation
+                    if ((window as any).api?.openUrlInBrowserTab) {
+                        // Use IPC to open the URL in a new browser tab
+                        (window as any).api.openUrlInBrowserTab(href);
+                    }
+                });
+            }
+        });
     }
 
     if (!speak) {

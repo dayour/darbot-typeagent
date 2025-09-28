@@ -9,20 +9,27 @@ import {
     SpeechToken,
     ShellUserSettings,
     Client,
-} from "../../preload/electronTypes.js";
-import { ChatView } from "./chatView";
+    SearchMenuItem,
+} from "../../preload/electronTypes";
+import { ChatView } from "./chat/chatView";
 import { TabView } from "./tabView";
 import { getSpeechToken, setSpeechToken } from "./speechToken";
 import { iconHelp, iconMetrics, iconSettings } from "./icon";
 import { SettingsView } from "./settingsView";
 import { HelpView } from "./helpView";
-import { MetricsView } from "./metricsView";
+import { MetricsView } from "./chat/metricsView";
 import { CameraView } from "./cameraView";
 import { createWebSocket, webapi, webdispatcher } from "./webSocketAPI";
 import * as jose from "jose";
-import { AppAgentEvent } from "@typeagent/agent-sdk";
-import { ClientIO, Dispatcher } from "agent-dispatcher";
+import { AppAgentEvent, DisplayContent } from "@typeagent/agent-sdk";
+import { ClientIO, Dispatcher, IAgentMessage } from "agent-dispatcher";
 import { swapContent } from "./setContent";
+import { remoteSearchMenuUIOnCompletion } from "./searchMenuUI/remoteSearchMenuUI";
+import { ChatInput } from "./chat/chatInput";
+
+export function isElectron(): boolean {
+    return globalThis.api !== undefined;
+}
 
 export function getClientAPI(): ClientAPI {
     if (globalThis.api !== undefined) {
@@ -36,7 +43,7 @@ export function getAndroidAPI() {
     return globalThis.Android;
 }
 
-export function getDispatcher(): Dispatcher {
+async function getDispatcher(): Promise<Dispatcher> {
     if (globalThis.dispatcher !== undefined) {
         return globalThis.dispatcher;
     }
@@ -134,7 +141,7 @@ async function initializeChatHistory(chatView: ChatView) {
     }
 }
 
-function addEvents(
+function registerClient(
     chatView: ChatView,
     agents: Map<string, string>,
     settingsView: SettingsView,
@@ -236,6 +243,22 @@ function addEvents(
                         requestId,
                     });
                     break;
+
+                // Display-focused events - for now show toast notification inline
+                // TODO: Design for toast notifications in shell
+                case AppAgentEvent.Inline:
+                case AppAgentEvent.Toast:
+                    handleInlineNotification(data, source, requestId, chatView);
+                    // Also add to notifications list for @notify show
+                    notifications.push({
+                        event,
+                        source,
+                        data,
+                        read: false,
+                        requestId,
+                    });
+                    break;
+
                 default:
                 // ignore
             }
@@ -289,9 +312,9 @@ function addEvents(
 
     const client: Client = {
         clientIO,
-        updateRegisterAgents(updatedAgents: Map<string, string>): void {
+        updateRegisterAgents(updatedAgents: [string, string][]): void {
             agents.clear();
-            for (const [key, value] of updatedAgents.entries()) {
+            for (const [key, value] of updatedAgents) {
                 agents.set(key, value);
             }
         },
@@ -309,14 +332,27 @@ function addEvents(
             settingsView.shellSettings = settings;
         },
         fileSelected(fileName: string, fileContent: string): void {
-            chatView.chatInput.loadImageContent(fileName, fileContent);
+            chatView.chatInput?.loadImageContent(fileName, fileContent);
         },
         listen(token: SpeechToken | undefined, useLocalWhisper: boolean): void {
             if (token !== undefined) {
                 setSpeechToken(token);
             }
 
-            chatView.chatInput.recognizeOnce(token, useLocalWhisper);
+            chatView.chatInput?.recognizeOnce(token, useLocalWhisper);
+        },
+        focusInput(): void {
+            chatView.chatInput?.focus();
+        },
+        searchMenuCompletion(id: number, item: SearchMenuItem) {
+            remoteSearchMenuUIOnCompletion(id, item);
+        },
+        titleUpdated(title: string): void {
+            // update document title
+            document.title = title;
+
+            // update chatview title
+            chatView.setTitle(title);
         },
     };
 
@@ -413,13 +449,17 @@ document.addEventListener("DOMContentLoaded", async function () {
     wrapper.appendChild(tabs.getContainer());
 
     document.onkeyup = (ev: KeyboardEvent) => {
-        if (ev.key == "Escape") {
+        if (ev.key === "Escape") {
             tabs.closeTabs();
             ev.preventDefault();
         }
     };
 
     const chatView = new ChatView(idGenerator, agents);
+    const chatInput = new ChatInput({}, "phraseDiv");
+
+    chatView.setChatInput(chatInput);
+
     initializeChatHistory(chatView);
 
     const cameraView = new CameraView((image: HTMLImageElement) => {
@@ -428,9 +468,9 @@ document.addEventListener("DOMContentLoaded", async function () {
         newImage.src = image.src;
 
         newImage.classList.add("chat-input-dropImage");
-        chatView.chatInput.textarea.getTextEntry().append(newImage);
+        chatView.chatInput?.textarea.getTextEntry().append(newImage);
 
-        if (chatView.chatInput.sendButton !== undefined) {
+        if (chatView.chatInput?.sendButton !== undefined) {
             chatView.chatInput.sendButton.disabled =
                 chatView.chatInput.textarea.getTextEntry().innerHTML.length ==
                 0;
@@ -440,11 +480,11 @@ document.addEventListener("DOMContentLoaded", async function () {
     wrapper.appendChild(cameraView.getContainer());
     wrapper.appendChild(chatView.getMessageElm());
 
-    chatView.chatInput.camButton.onclick = () => {
+    chatView.chatInput!.camButton.onclick = () => {
         cameraView.toggleVisibility();
     };
 
-    chatView.chatInput.attachButton.onclick = () => {
+    chatView.chatInput!.attachButton.onclick = () => {
         getClientAPI().openImageFile();
     };
 
@@ -456,9 +496,7 @@ document.addEventListener("DOMContentLoaded", async function () {
     );
     tabs.getTabContainerByName("Help").append(new HelpView().getContainer());
 
-    addEvents(chatView, agents, settingsView, tabs, cameraView);
-
-    chatView.chatInputFocus();
+    registerClient(chatView, agents, settingsView, tabs, cameraView);
 
     try {
         if (Android !== undefined) {
@@ -484,31 +522,47 @@ document.addEventListener("DOMContentLoaded", async function () {
     }
 
     watchForDOMChanges(chatView.getScrollContainer());
+
+    getDispatcher().then((dispatcher) => {
+        chatView.initializeDispatcher(dispatcher);
+    });
 });
 
 function watchForDOMChanges(element: HTMLDivElement) {
-    // ignore attribute changes but watch for
-    const config = { attributes: false, childList: true, subtree: true };
-
     // timeout
-    let idleCounter: number = 0;
-
-    // observer callback
-    const observer = new MutationObserver(() => {
-        // increment the idle counter
-        idleCounter++;
-
-        // decrement the idle counter
+    let lastModifiedTime: number = 0;
+    let hasTimeout = false;
+    const scheduleSaveChatHistory = () => {
+        if (hasTimeout) {
+            // Already scheduled.
+            return;
+        }
+        hasTimeout = true;
         setTimeout(() => {
-            if (--idleCounter == 0) {
-                // last one notifies main process
+            hasTimeout = false;
+            const idleTime = Date.now() - lastModifiedTime;
+            if (idleTime >= 250) {
+                // been idle for 3 seconds, save the chat history
                 getClientAPI().saveChatHistory(element.innerHTML);
+            } else {
+                // not idle long enough, reschedule
+                scheduleSaveChatHistory();
             }
-        }, 3000);
+        });
+    };
+    // observer
+    const observer = new MutationObserver(() => {
+        // Update the last modified time
+        lastModifiedTime = Date.now();
+
+        // schedule to save chat history
+        scheduleSaveChatHistory();
     });
 
+    // ignore attribute changes but watch for
+    const config = { attributes: false, childList: true, subtree: true };
     // start observing
-    observer.observe(element!, config);
+    observer.observe(element, config);
 
     // observer.disconnect();
 }
@@ -545,4 +599,26 @@ function getDateDifferenceDescription(date1: Date, date2: Date): string {
     } else {
         return date1.toLocaleDateString("en-US", { weekday: "long" });
     }
+}
+
+function handleInlineNotification(
+    data: string | DisplayContent,
+    source: string,
+    requestId: string | undefined,
+    chatView: ChatView,
+): void {
+    const agentRequestId =
+        requestId && requestId.startsWith("agent-")
+            ? requestId
+            : `agent-${source}-${Date.now()}`;
+
+    const agentMessage: IAgentMessage = {
+        message: data,
+        requestId: agentRequestId,
+        source: source,
+        actionIndex: 0,
+    };
+
+    // Add to chat view with notification flag
+    chatView.addAgentMessage(agentMessage, { notification: true });
 }

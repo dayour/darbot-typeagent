@@ -1,7 +1,6 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-import { removePageSchema } from "./storage";
 import { sendActionToAgent } from "./websocket";
 import { getWebSocket } from "./websocket";
 
@@ -28,8 +27,14 @@ export function initializeContextMenu(): void {
     });
 
     chrome.contextMenus.create({
-        title: "Discover page Schema",
-        id: "discoverPageSchema",
+        title: "Discover page macros",
+        id: "discoverPageActions",
+        documentUrlPatterns: ["http://*/*", "https://*/*"],
+    });
+
+    chrome.contextMenus.create({
+        title: "Manage Macros",
+        id: "manageMacros",
         documentUrlPatterns: ["http://*/*", "https://*/*"],
     });
 
@@ -37,7 +42,7 @@ export function initializeContextMenu(): void {
         id: "sidepanel-registerAgent",
         title: "Update Page Agent",
         contexts: ["all"],
-        documentUrlPatterns: ["chrome-extension://*/sidepanel.html"],
+        documentUrlPatterns: ["chrome-extension://*/views/pageMacros.html"],
     });
 
     chrome.contextMenus.create({
@@ -46,16 +51,25 @@ export function initializeContextMenu(): void {
     });
 
     chrome.contextMenus.create({
-        id: "extractSchemaCurrentPage",
-        title: "Get schema.org metadata from this page",
-        contexts: ["page"],
+        title: "Extract knowledge from page",
+        id: "extractKnowledgeFromPage",
         documentUrlPatterns: ["http://*/*", "https://*/*"],
     });
 
     chrome.contextMenus.create({
-        id: "extractSchemaLinkedPages",
-        title: "Get schema.org metadata from linked pages",
-        contexts: ["page"],
+        title: "View Knowledge Library",
+        id: "showWebsiteLibrary",
+        documentUrlPatterns: ["http://*/*", "https://*/*"],
+    });
+
+    chrome.contextMenus.create({
+        type: "separator",
+        id: "menuSeparator3",
+    });
+
+    chrome.contextMenus.create({
+        title: "View Annotations",
+        id: "showAnnotationsLibrary",
         documentUrlPatterns: ["http://*/*", "https://*/*"],
     });
 }
@@ -95,13 +109,51 @@ export async function handleContextMenuClick(
         }
         case "clearCrosswordPageCache": {
             // remove cached schema for current tab
-            if (tab.url) {
-                await removePageSchema(tab.url);
+            // trigger translator
+            const webSocket = getWebSocket();
+            if (
+                tab.url &&
+                webSocket &&
+                webSocket.readyState === WebSocket.OPEN
+            ) {
+                webSocket.send(
+                    JSON.stringify({
+                        method: "removeCrosswordPageCache",
+                        params: { url: tab.url },
+                    }),
+                );
             }
             break;
         }
-        case "discoverPageSchema": {
+        case "discoverPageActions": {
             await chrome.sidePanel.open({ tabId: tab.id! });
+
+            await chrome.sidePanel.setOptions({
+                tabId: tab.id!,
+                path: "views/pageMacros.html",
+                enabled: true,
+            });
+            break;
+        }
+        case "manageMacros": {
+            // Check if macrosLibrary tab already exists
+            const existingTabs = await chrome.tabs.query({
+                url: chrome.runtime.getURL("views/macrosLibrary.html"),
+            });
+
+            if (existingTabs.length > 0) {
+                // Switch to existing tab
+                await chrome.tabs.update(existingTabs[0].id!, { active: true });
+                await chrome.windows.update(existingTabs[0].windowId!, {
+                    focused: true,
+                });
+            } else {
+                // Create new tab
+                await chrome.tabs.create({
+                    url: chrome.runtime.getURL("views/macrosLibrary.html"),
+                    active: true,
+                });
+            }
             break;
         }
         case "sidepanel-registerAgent": {
@@ -111,24 +163,76 @@ export async function handleContextMenuClick(
             });
             break;
         }
-        case "extractSchemaCurrentPage": {
-            await chrome.tabs.sendMessage(
-                tab.id!,
-                {
-                    type: "extractSchemaCurrentPage",
-                },
-                { frameId: 0 },
-            );
+
+        case "extractKnowledgeFromPage": {
+            await chrome.sidePanel.open({ tabId: tab.id! });
+
+            await chrome.sidePanel.setOptions({
+                tabId: tab.id!,
+                path: "views/pageKnowledge.html",
+                enabled: true,
+            });
+
             break;
         }
-        case "extractSchemaLinkedPages": {
-            await chrome.tabs.sendMessage(
-                tab.id!,
-                {
-                    type: "extractSchemaLinkedPages",
-                },
-                { frameId: 0 },
+
+        case "showWebsiteLibrary": {
+            const knowledgeLibraryUrl = chrome.runtime.getURL(
+                "views/knowledgeLibrary.html",
             );
+
+            // Check if knowledge library tab is already open
+            const existingTabs = await chrome.tabs.query({
+                url: knowledgeLibraryUrl,
+            });
+
+            if (existingTabs.length > 0) {
+                // Switch to existing tab
+                await chrome.tabs.update(existingTabs[0].id!, { active: true });
+                // Focus the window containing the tab
+                if (existingTabs[0].windowId) {
+                    await chrome.windows.update(existingTabs[0].windowId, {
+                        focused: true,
+                    });
+                }
+            } else {
+                // Create new tab
+                await chrome.tabs.create({
+                    url: knowledgeLibraryUrl,
+                    active: true,
+                });
+            }
+
+            break;
+        }
+
+        case "showAnnotationsLibrary": {
+            const annotationsLibraryUrl = chrome.runtime.getURL(
+                "views/annotationsLibrary.html",
+            );
+
+            // Check if knowledge library tab is already open
+            const existingTabs = await chrome.tabs.query({
+                url: annotationsLibraryUrl,
+            });
+
+            if (existingTabs.length > 0) {
+                // Switch to existing tab
+                await chrome.tabs.update(existingTabs[0].id!, { active: true });
+                // Focus the window containing the tab
+                if (existingTabs[0].windowId) {
+                    await chrome.windows.update(existingTabs[0].windowId, {
+                        focused: true,
+                    });
+                }
+            } else {
+                // Create new tab
+                await chrome.tabs.create({
+                    url: annotationsLibraryUrl,
+                    active: true,
+                });
+            }
+
             break;
         }
     }

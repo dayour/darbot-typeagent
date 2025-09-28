@@ -1,7 +1,6 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-import { ChildProcess } from "child_process";
 import { DeepPartialUndefined, Limiter, createLimiter } from "common-utils";
 import {
     ChildLogger,
@@ -21,10 +20,13 @@ import {
     setupAgentCache,
     setupBuiltInCache,
 } from "./session.js";
-import { TypeAgentTranslator } from "../translation/agentTranslators.js";
+import { IndexingServiceRegistry } from "./indexingServiceRegistry.js";
+import {
+    getAppAgentName,
+    TypeAgentTranslator,
+} from "../translation/agentTranslators.js";
 import { ActionConfigProvider } from "../translation/actionConfigProvider.js";
 import { getCacheFactory } from "../utils/cacheFactory.js";
-import { createServiceHost } from "./system/handlers/serviceHost/serviceHostCommandHandler.js";
 import { ClientIO, nullClientIO, RequestId } from "./interactiveIO.js";
 import { ChatHistory, createChatHistory } from "./chatHistory.js";
 
@@ -40,6 +42,7 @@ import {
 } from "@typeagent/agent-sdk";
 import { Profiler } from "telemetry";
 import { conversation as Conversation } from "knowledge-processor";
+import { ConversationMemory } from "conversation-memory";
 import {
     AppAgentManager,
     AppAgentStateInitSettings,
@@ -53,10 +56,7 @@ import {
     ConstructionProvider,
 } from "../agentProvider/agentProvider.js";
 import { RequestMetricsManager } from "../utils/metrics.js";
-import {
-    ActionContextWithClose,
-    getSchemaNamePrefix,
-} from "../execute/actionHandlers.js";
+import { getSchemaNamePrefix } from "../execute/actionHandlers.js";
 import { displayError } from "@typeagent/agent-sdk/helpers/display";
 
 import {
@@ -73,6 +73,8 @@ import { CommandResult } from "../dispatcher.js";
 import { DispatcherName } from "./dispatcher/dispatcherUtils.js";
 import lockfile from "proper-lockfile";
 import { IndexManager } from "./indexManager.js";
+import { ActionContextWithClose } from "../execute/actionContext.js";
+import { initializeMemory } from "./memory.js";
 
 const debug = registerDebug("typeagent:dispatcher:init");
 const debugError = registerDebug("typeagent:dispatcher:init:error");
@@ -109,9 +111,11 @@ export type CommandHandlerContext = {
     readonly embeddingCacheDir: string | undefined;
 
     readonly indexManager: IndexManager;
+    readonly indexingServiceRegistry: IndexingServiceRegistry | undefined;
 
     activityContext?: ActivityContext | undefined;
     conversationManager?: Conversation.ConversationManager | undefined;
+    conversationMemory?: ConversationMemory | undefined;
     // Per activation configs
     developerMode?: boolean;
     explanationAsynchronousMode: boolean;
@@ -122,11 +126,11 @@ export type CommandHandlerContext = {
     // Runtime context
     commandLock: Limiter; // Make sure we process one command at a time.
     lastActionSchemaName: string;
+    pendingToggleTransientAgents: [string, boolean][];
     translatorCache: Map<string, TypeAgentTranslator>;
     agentCache: AgentCache;
     currentScriptDir: string;
     logger?: Logger | undefined;
-    serviceHost: ChildProcess | undefined;
     requestId?: RequestId;
     commandResult?: CommandResult | undefined;
     chatHistory: ChatHistory;
@@ -199,6 +203,12 @@ export type DispatcherOptions = DeepPartialUndefined<DispatcherConfig> & {
     allowSharedLocalView?: string[]; // agents that can access any shared local views, default to undefined
     portBase?: number; // default to 9001
 
+    // Indexing service discovery
+    indexingServiceRegistry?: IndexingServiceRegistry; // registry for indexing service discovery
+
+    // Agent specific initialization options.
+    agentInitOptions?: Record<string, unknown>; // agent specific initialization options.
+
     // Logging options
     metrics?: boolean; // default to false
     collectCommandResult?: boolean; // default to false
@@ -207,7 +217,6 @@ export type DispatcherOptions = DeepPartialUndefined<DispatcherConfig> & {
 
     // Additional integration options
     agentInstaller?: AppAgentInstaller;
-    enableServiceHost?: boolean; // default to false,
     constructionProvider?: ConstructionProvider;
     explanationAsynchronousMode?: boolean; // default to true
 
@@ -215,18 +224,28 @@ export type DispatcherOptions = DeepPartialUndefined<DispatcherConfig> & {
     embeddingCacheDir?: string | undefined; // default to 'cache' under 'persistDir' if specified
 };
 
-async function getSession(instanceDir?: string) {
+async function getSession(
+    instanceDir?: string,
+    indexingServiceRegistry?: IndexingServiceRegistry,
+) {
     let session: Session | undefined;
     if (instanceDir !== undefined) {
         try {
-            session = await Session.restoreLastSession(instanceDir);
+            session = await Session.restoreLastSession(
+                instanceDir,
+                indexingServiceRegistry,
+            );
         } catch (e: any) {
             debugError(`WARNING: ${e.message}. Creating new session.`);
         }
     }
     if (session === undefined) {
         // fill in the translator/action later.
-        session = await Session.create(undefined, instanceDir);
+        session = await Session.create(
+            undefined,
+            instanceDir,
+            indexingServiceRegistry,
+        );
     }
     return session;
 }
@@ -383,6 +402,7 @@ export async function initializeCommandHandlerContext(
     try {
         const session = await getSession(
             persistSession ? persistDir : undefined,
+            options?.indexingServiceRegistry,
         );
 
         // initialization options set the default, but persisted configuration will still overrides it.
@@ -403,11 +423,6 @@ export async function initializeCommandHandlerContext(
             activationId: randomUUID(),
         });
 
-        var serviceHost = undefined;
-        if (options?.enableServiceHost) {
-            serviceHost = await createServiceHost();
-        }
-
         const cacheDir = persistDir ? ensureCacheDir(persistDir) : undefined;
         const embeddingCacheDir = options?.embeddingCacheDir;
         if (embeddingCacheDir) {
@@ -418,6 +433,7 @@ export async function initializeCommandHandlerContext(
             cacheDir,
             portBase,
             options?.allowSharedLocalView,
+            options?.agentInitOptions,
         );
         const constructionProvider = options?.constructionProvider;
         const context: CommandHandlerContext = {
@@ -427,14 +443,13 @@ export async function initializeCommandHandlerContext(
             persistDir,
             cacheDir,
             embeddingCacheDir,
-            conversationManager:
-                await createConversationManager(sessionDirPath),
             explanationAsynchronousMode,
             dblogging: options?.dblogging ?? false,
             clientIO,
 
             // Runtime context
             commandLock: createLimiter(1), // Make sure we process one command at a time.
+            pendingToggleTransientAgents: [],
             agentCache: await getAgentCache(
                 session,
                 agents,
@@ -448,15 +463,16 @@ export async function initializeCommandHandlerContext(
                 session.getConfig().execution.history,
             ),
             logger,
-            serviceHost,
             metricsManager: metrics ? new RequestMetricsManager() : undefined,
             batchMode: false,
             instanceDirLock,
             constructionProvider,
             collectCommandResult: options?.collectCommandResult ?? false,
             indexManager: IndexManager.getInstance(),
+            indexingServiceRegistry: options?.indexingServiceRegistry,
         };
 
+        await initializeMemory(context, sessionDirPath);
         await addAppAgentProviders(context, options?.appAgentProviders);
 
         const appAgentStateSettings = getAppAgentStateSettings(
@@ -541,7 +557,9 @@ function processSetAppAgentStateResult(
             hasFailed = true;
             const prefix =
                 stateName === "commands"
-                    ? systemContext.agents.getEmojis()[schemaName]
+                    ? systemContext.agents.getAppAgentEmoji(
+                          getAppAgentName(schemaName),
+                      )
                     : getSchemaNamePrefix(schemaName, systemContext);
             debugError(e);
             cbError(
@@ -557,7 +575,6 @@ function processSetAppAgentStateResult(
 export async function closeCommandHandlerContext(
     context: CommandHandlerContext,
 ) {
-    context.serviceHost?.kill();
     // Save the session because the token count is in it.
     context.session.save();
     await context.agents.close();
@@ -566,18 +583,6 @@ export async function closeCommandHandlerContext(
     }
 }
 
-async function createConversationManager(
-    sessionDirPath: string | undefined,
-): Promise<Conversation.ConversationManager | undefined> {
-    return sessionDirPath
-        ? await Conversation.createConversationManager(
-              {},
-              "conversation",
-              sessionDirPath,
-              false,
-          )
-        : undefined;
-}
 export async function setSessionOnCommandHandlerContext(
     context: CommandHandlerContext,
     session: Session,
@@ -585,9 +590,7 @@ export async function setSessionOnCommandHandlerContext(
     context.session = session;
     await context.agents.close();
 
-    context.conversationManager = await createConversationManager(
-        session.getSessionDirPath(),
-    );
+    await initializeMemory(context, session.getSessionDirPath());
     context.agentCache = await getAgentCache(
         context.session,
         context.agents,

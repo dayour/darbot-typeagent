@@ -22,8 +22,10 @@ import {
 import {
     searchQueryFromLanguage,
     SearchQueryTranslator,
+    searchQueryFromLanguage2,
 } from "./searchQueryTranslator.js";
 import * as querySchema from "./searchQuerySchema.js";
+import * as querySchema2 from "./searchQuerySchema_v2.js";
 import { PropertyTermSet } from "./collections.js";
 import { dateRangeFromDateTimeRange } from "./common.js";
 import { PropertyNames } from "./propertyIndex.js";
@@ -45,12 +47,13 @@ import {
 */
 
 /**
- * Type representing the filter options for language search.
+ * Filter options for language search.
  */
 export type LanguageSearchFilter = {
     knowledgeType?: KnowledgeType | undefined;
     threadDescription?: string | undefined;
     tags?: string[] | undefined;
+    scopeDefiningTerms?: SearchTermGroup | undefined;
 };
 
 /**
@@ -144,12 +147,23 @@ export async function searchConversationWithLanguage(
     }
     return success(searchResults);
 
+    //
+    // Scoping queries can be precise. However, there may be random variations in how LLMs
+    // translate some user utterances into queries.. .particularly verbs. They verbs
+    // may not match action verbs actually in the index.. related terms may not meet the similarity
+    // cutoff.
+    // If configured (compileOptions.exactScope == false), we can do a fallback query that does
+    // not enforce verb matching. This improves recall while still providing a reasonable level of scoping because it
+    //
     function compileFallbackQuery(
         query: querySchema.SearchQuery,
         compileOptions: LanguageQueryCompileOptions,
         langSearchFilter?: LanguageSearchFilter,
     ): SearchQueryExpr[] | undefined {
         const verbScope = compileOptions.verbScope;
+        //
+        // If no exact scope... and verbScope is not provided or true,
+        // then we can build a fallback query that is more forgiving
         if (
             !compileOptions.exactScope &&
             (verbScope == undefined || verbScope)
@@ -164,17 +178,10 @@ export async function searchConversationWithLanguage(
                 langSearchFilter,
             );
         }
+        //
+        // No fallback query currently possible
+        //
         return undefined;
-    }
-
-    function createTextQueryOptions(
-        options: LanguageSearchOptions,
-    ): SearchOptions {
-        const ragOptions: SearchOptions = {
-            ...options,
-            ...options.fallbackRagOptions,
-        };
-        return ragOptions;
     }
 }
 
@@ -248,6 +255,9 @@ export type LanguageQueryCompileOptions = {
      * Is fuzzy matching enabled when applying scope?
      */
     exactScope?: boolean | undefined;
+    /**
+     * Should use verbs in scoping expressions (default true)
+     */
     verbScope?: boolean | undefined;
     // Use to ignore noise terms etc.
     termFilter?: (text: string) => boolean;
@@ -484,6 +494,10 @@ class SearchQueryCompiler {
             when.dateRange = dateRangeFromDateTimeRange(filter.timeRange);
         }
         if (this.langSearchFilter) {
+            if (this.langSearchFilter.knowledgeType) {
+                when ??= {};
+                when.knowledgeType = this.langSearchFilter.knowledgeType;
+            }
             if (
                 this.langSearchFilter.tags &&
                 this.langSearchFilter.tags.length > 0
@@ -498,6 +512,17 @@ class SearchQueryCompiler {
                 when ??= {};
                 when.threadDescription =
                     this.langSearchFilter.threadDescription;
+            }
+            if (this.langSearchFilter.scopeDefiningTerms) {
+                when ??= {};
+                if (when.scopeDefiningTerms) {
+                    when.scopeDefiningTerms.terms.push(
+                        this.langSearchFilter.scopeDefiningTerms,
+                    );
+                } else {
+                    when.scopeDefiningTerms =
+                        this.langSearchFilter.scopeDefiningTerms;
+                }
             }
         }
         return when;
@@ -559,6 +584,7 @@ class SearchQueryCompiler {
         entityTerms: querySchema.EntityTerm[],
         termGroup: SearchTermGroup,
         useOrMax: boolean = true,
+        searchTopics: boolean = true, // Entity names and facet values can also be seen as topics
     ): void {
         if (useOrMax) {
             const dedupe = this.dedupe;
@@ -566,7 +592,7 @@ class SearchQueryCompiler {
             for (const term of entityTerms) {
                 const orMax = createOrMaxTermGroup();
                 this.addEntityTermToGroup(term, orMax);
-                termGroup.terms.push(optimizeOrMax(orMax));
+                termGroup.terms.push(optimizeTermGroup(orMax));
             }
             this.dedupe = dedupe;
         } else {
@@ -574,17 +600,19 @@ class SearchQueryCompiler {
                 this.addEntityTermToGroup(term, termGroup);
             }
         }
-        // Also search for topics
-        for (const term of entityTerms) {
-            this.addEntityNameToGroup(term, PropertyNames.Topic, termGroup);
-            if (term.facets) {
-                for (const facet of term.facets) {
-                    if (!isWildcard(facet.facetValue)) {
-                        this.addPropertyTermToGroup(
-                            facet.facetValue,
-                            PropertyNames.Topic,
-                            termGroup,
-                        );
+        if (searchTopics) {
+            // Also search for topics,
+            for (const term of entityTerms) {
+                this.addEntityNameToGroup(term, PropertyNames.Topic, termGroup);
+                if (term.facets) {
+                    for (const facet of term.facets) {
+                        if (!isWildcard(facet.facetValue)) {
+                            this.addPropertyTermToGroup(
+                                facet.facetValue,
+                                PropertyNames.Topic,
+                                termGroup,
+                            );
+                        }
                     }
                 }
             }
@@ -601,7 +629,7 @@ class SearchQueryCompiler {
             for (const term of entityTerms) {
                 this.addEntityTermAsSearchTermsToGroup(term, orMax);
             }
-            termGroup.terms.push(optimizeOrMax(orMax));
+            termGroup.terms.push(optimizeTermGroup(orMax));
         } else {
             for (const term of entityTerms) {
                 this.addEntityTermAsSearchTermsToGroup(term, termGroup);
@@ -900,6 +928,297 @@ class SearchQueryCompiler {
         // isEntityTermArray checks for wildcards etc
         return isEntityTermArray(actionTerm.actorEntities);
     }
+
+    /**
+     * Experimental V2
+     */
+
+    public compileQuery2(query: querySchema2.SearchQuery): SearchQueryExpr[] {
+        // Clone the query so we can modify it
+        query = { ...query };
+        const queryExpressions: SearchQueryExpr[] = [];
+        for (const searchExpr of query.searchExpressions) {
+            queryExpressions.push(this.compileSearchExpr2(searchExpr));
+        }
+        return queryExpressions;
+    }
+
+    public compileSearchExpr2(
+        searchExpr: querySchema2.SearchExpr,
+    ): SearchQueryExpr {
+        const queryExpr: SearchQueryExpr = {
+            selectExpressions: [],
+        };
+        if (searchExpr.filters) {
+            for (const filter of searchExpr.filters) {
+                queryExpr.selectExpressions.push(
+                    this.compileSearchFilter2(filter),
+                );
+            }
+        }
+        queryExpr.rawQuery = searchExpr.rewrittenQuery;
+        return queryExpr;
+    }
+
+    public compileSearchFilter2(
+        filter: querySchema2.SearchFilter,
+    ): SearchSelectExpr {
+        let searchTermGroup = this.compileTermGroup(filter);
+        let when = this.compileWhen(filter);
+        if (filter.scopeSubQuery !== undefined) {
+            when = this.compileScopeFilter(filter.scopeSubQuery, when);
+        }
+        return {
+            searchTermGroup,
+            when,
+        };
+    }
+
+    private compileScopeFilter(
+        filter: querySchema2.ScopeFilter,
+        when: WhenFilter | undefined,
+    ): WhenFilter | undefined {
+        when ??= {};
+        if (filter.timeRange) {
+            when.dateRange = dateRangeFromDateTimeRange(filter.timeRange);
+        }
+        if (
+            filter.entitySearchTerms !== undefined &&
+            filter.entitySearchTerms.length > 0
+        ) {
+            // Compile entity terms to search structured tags
+            let termGroup = this.compileEntityTermsForScope(
+                filter.entitySearchTerms,
+            );
+            when.tagMatchingTerms = termGroup;
+            /*
+            if (when.scopeDefiningTerms) {
+                when.scopeDefiningTerms.terms.push(termGroup);
+            } else {
+                when.scopeDefiningTerms = termGroup;
+            }
+            */
+        }
+
+        /*
+        if (filter.searchTerms !== undefined && filter.searchTerms.length > 0) {
+            when.tags ??= [];
+            when.tags.push(...filter.searchTerms);
+        }
+            */
+        return when;
+    }
+
+    private compileEntityTermsForScope(
+        entityTerms: querySchema.EntityTerm[],
+    ): SearchTermGroup {
+        let termGroup = createAndTermGroup();
+        const dedupe = this.dedupe;
+        this.dedupe = false;
+        for (const term of entityTerms) {
+            const orMax = createOrMaxTermGroup();
+            this.addEntityTermToGroup(term, orMax);
+            // Also search for vanilla tags
+            this.addTagToGroup(term.name, orMax);
+            termGroup.terms.push(optimizeTermGroup(orMax));
+        }
+        this.dedupe = dedupe;
+        return termGroup;
+    }
+
+    private addTagToGroup(tag: string, termGroup: SearchTermGroup): void {
+        if (tag && !isWildcard(tag)) {
+            termGroup.terms.push(
+                createPropertySearchTerm(PropertyNames.Tag, tag),
+            );
+        }
+    }
+}
+
+// Experimental: explicit NLP to scope expressions
+export function compileSearchQuery2(
+    conversation: IConversation,
+    query: querySchema2.SearchQuery,
+    options?: LanguageQueryCompileOptions,
+    langSearchFilter?: LanguageSearchFilter,
+): SearchQueryExpr[] {
+    const queryBuilder = new SearchQueryCompiler(
+        conversation,
+        options,
+        langSearchFilter,
+    );
+    const searchQueryExprs: SearchQueryExpr[] =
+        queryBuilder.compileQuery2(query);
+    return searchQueryExprs;
+}
+
+export async function searchQueryExprFromLanguage2(
+    conversation: IConversation,
+    translator: SearchQueryTranslator,
+    queryText: string,
+    options?: LanguageSearchOptions,
+    languageSearchFilter?: LanguageSearchFilter,
+    debugContext?: LanguageSearchDebugContext,
+): Promise<Result<LanguageQueryExpr>> {
+    const queryResult = await searchQueryFromLanguage2(
+        conversation,
+        translator,
+        queryText,
+        options?.modelInstructions,
+    );
+    if (queryResult.success) {
+        const query = queryResult.data;
+        if (debugContext) {
+            debugContext.searchQuery = query;
+        }
+        options ??= createLanguageSearchOptions();
+        const queryExpressions = compileSearchQuery2(
+            conversation,
+            query,
+            options.compileOptions,
+            languageSearchFilter,
+        );
+        return success({
+            queryText,
+            query,
+            queryExpressions,
+        });
+    }
+    return queryResult;
+}
+
+/**
+ * Experimental...
+ * Uses an improved schema to better capture "scope" clauses from natural language queries
+ * Scopes can now be explicitly specified as 'sub-queries'... scope filters. This leads to a more
+ * robust "where" operator
+ *
+ * Search a conversation using natural language. Returns {@link ConversationSearchResult} containing
+ * relevant knowledge and messages.
+ *
+ * @param conversation - The conversation object to search within.
+ * @param searchText - The natural language search phrase.
+ * @param queryTranslator - Translates natural language to a {@link querySchema.SearchQuery} structured query.
+ * @param options - Optional search options.
+ * @param langSearchFilter - Optional filter options for the search.
+ * @param debugContext - Optional context for debugging the search process.
+ * @returns {ConversationSearchResult} Conversation search results.
+ */
+export async function searchConversationWithLanguage2(
+    conversation: IConversation,
+    searchText: string,
+    queryTranslator: SearchQueryTranslator,
+    options?: LanguageSearchOptions,
+    langSearchFilter?: LanguageSearchFilter,
+    debugContext?: LanguageSearchDebugContext,
+): Promise<Result<ConversationSearchResult[]>> {
+    options ??= createLanguageSearchOptions();
+    const langQueryResult = await searchQueryExprFromLanguage2(
+        conversation,
+        queryTranslator,
+        searchText,
+        options,
+        langSearchFilter,
+        debugContext,
+    );
+    if (!langQueryResult.success) {
+        return langQueryResult;
+    }
+    const searchQueryExprs = langQueryResult.data.queryExpressions;
+    if (debugContext) {
+        debugContext.searchQueryExpr = searchQueryExprs;
+        debugContext.usedSimilarityFallback = new Array<boolean>(
+            searchQueryExprs.length,
+        );
+        debugContext.usedSimilarityFallback.fill(false);
+    }
+    let fallbackQueryExpr = compileFallbackQuery(
+        langQueryResult.data.query,
+        options.compileOptions,
+        langSearchFilter,
+    );
+
+    const searchResults: ConversationSearchResult[] = [];
+    for (let i = 0; i < searchQueryExprs.length; ++i) {
+        const searchQuery = searchQueryExprs[i];
+        const fallbackQuery = fallbackQueryExpr
+            ? fallbackQueryExpr[i]
+            : undefined;
+        let queryResult = await runSearchQuery(
+            conversation,
+            searchQuery,
+            options,
+        );
+        if (!hasConversationResults(queryResult) && fallbackQuery) {
+            // Rerun the query but with verb matching turned off for scopes
+            queryResult = await runSearchQuery(
+                conversation,
+                fallbackQuery,
+                options,
+            );
+        }
+        //
+        // If no matches and fallback enabled... run the raw query
+        //
+        if (
+            !hasConversationResults(queryResult) &&
+            searchQuery.rawQuery &&
+            options.fallbackRagOptions
+        ) {
+            const textSearchOptions = createTextQueryOptions(options);
+            const ragMatches = await runSearchQueryTextSimilarity(
+                conversation,
+                fallbackQuery ?? searchQuery,
+                textSearchOptions,
+            );
+            if (ragMatches) {
+                searchResults.push(...ragMatches);
+                if (debugContext?.usedSimilarityFallback) {
+                    debugContext.usedSimilarityFallback![i] = true;
+                }
+            }
+        } else {
+            searchResults.push(...queryResult);
+        }
+    }
+    return success(searchResults);
+
+    //
+    // Scoping queries can be precise. However, there may be random variations in how LLMs
+    // translate some user utterances into queries.. .particularly verbs. They verbs
+    // may not match action verbs actually in the index.. related terms may not meet the similarity
+    // cutoff.
+    // If configured (compileOptions.exactScope == false), we can do a fallback query that does
+    // not enforce verb matching. This improves recall while still providing a reasonable level of scoping because it
+    //
+    function compileFallbackQuery(
+        query: querySchema.SearchQuery,
+        compileOptions: LanguageQueryCompileOptions,
+        langSearchFilter?: LanguageSearchFilter,
+    ): SearchQueryExpr[] | undefined {
+        const verbScope = compileOptions.verbScope;
+        //
+        // If no exact scope... and verbScope is not provided or true,
+        // then we can build a fallback query that is more forgiving
+        if (
+            !compileOptions.exactScope &&
+            (verbScope == undefined || verbScope)
+        ) {
+            return compileSearchQuery2(
+                conversation,
+                query,
+                {
+                    ...compileOptions,
+                    verbScope: false,
+                },
+                langSearchFilter,
+            );
+        }
+        //
+        // No fallback query currently possible
+        //
+        return undefined;
+    }
 }
 
 const Wildcard = "*";
@@ -925,9 +1244,17 @@ function isEmptyString(value: string): boolean {
     return value === undefined || value.length === 0;
 }
 
-function optimizeOrMax(termGroup: SearchTermGroup) {
+function optimizeTermGroup(termGroup: SearchTermGroup) {
     if (termGroup.terms.length === 1) {
         return termGroup.terms[0];
     }
     return termGroup;
+}
+
+function createTextQueryOptions(options: LanguageSearchOptions): SearchOptions {
+    const ragOptions: SearchOptions = {
+        ...options,
+        ...options.fallbackRagOptions,
+    };
+    return ragOptions;
 }

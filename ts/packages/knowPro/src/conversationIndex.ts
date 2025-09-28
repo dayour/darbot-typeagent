@@ -13,6 +13,7 @@ import {
     MessageOrdinal,
     ScoredSemanticRefOrdinal,
     SemanticRefOrdinal,
+    StructuredTag,
     Tag,
     TextIndexingResult,
     TextLocation,
@@ -59,6 +60,20 @@ function addEntity(
         knowledgeType: "entity",
         knowledge: entity,
     });
+    addEntitySemanticRefToIndex(
+        entity,
+        semanticRefIndex,
+        semanticRefOrdinal,
+        termsAdded,
+    );
+}
+
+function addEntitySemanticRefToIndex(
+    entity: kpLib.ConcreteEntity,
+    semanticRefIndex: ITermToSemanticRefIndex,
+    semanticRefOrdinal: number,
+    termsAdded?: Set<string>,
+) {
     addTermToIndex(
         semanticRefIndex,
         entity.name,
@@ -223,11 +238,35 @@ function addTag(
     addTermToIndex(semanticRefIndex, tag.text, semanticRefOrdinal, termsAdded);
 }
 
+function addStructuredTag(
+    sTag: StructuredTag,
+    semanticRefs: ISemanticRefCollection,
+    semanticRefIndex: ITermToSemanticRefIndex,
+    messageOrdinal: MessageOrdinal,
+    chunkOrdinal: number,
+    termsAdded?: Set<string>,
+) {
+    const semanticRefOrdinal = semanticRefs.length;
+    semanticRefs.append({
+        semanticRefOrdinal,
+        range: textRangeFromMessageChunk(messageOrdinal, chunkOrdinal),
+        knowledgeType: "sTag",
+        knowledge: sTag,
+    });
+    addEntitySemanticRefToIndex(
+        sTag,
+        semanticRefIndex,
+        semanticRefOrdinal,
+        termsAdded,
+    );
+}
+
 export type KnowledgeValidator = (
     knowledgeType: KnowledgeType,
     knowledge: Knowledge,
 ) => boolean;
 
+// TODO: update: pass in TextLocation instead of messageOrdinal + chunkOrdinal
 export function addKnowledgeToSemanticRefIndex(
     conversation: IConversation,
     messageOrdinal: MessageOrdinal,
@@ -333,7 +372,7 @@ async function addBatchToSemanticRefIndex(
         addKnowledgeToSemanticRefIndex(
             conversation,
             textLocation.messageOrdinal,
-            textLocation.charOrdinal ?? 0,
+            textLocation.chunkOrdinal ?? 0,
             knowledge,
             termsAdded,
         );
@@ -649,9 +688,33 @@ export function addMessageKnowledgeToSemanticRefIndex(
         }
         if (msg.tags && semanticRefs) {
             for (const tag of msg.tags) {
-                const tagObj: Tag = { text: tag };
-                addTag(
-                    tagObj,
+                if (typeof tag === "string") {
+                    const tagObj: Tag = { text: tag };
+                    addTag(
+                        tagObj,
+                        semanticRefs,
+                        semanticRefIndex,
+                        messageOrdinal,
+                        chunkOrdinal,
+                        termsAdded,
+                    );
+                } else {
+                    addStructuredTag(
+                        tag,
+                        semanticRefs,
+                        semanticRefIndex,
+                        messageOrdinal,
+                        chunkOrdinal,
+                        termsAdded,
+                    );
+                }
+            }
+        }
+        /*
+        if (msg.sTags && semanticRefs) {
+            for (const sTag of msg.sTags) {
+                addStructuredTag(
+                    sTag,
                     semanticRefs,
                     semanticRefIndex,
                     messageOrdinal,
@@ -660,6 +723,7 @@ export function addMessageKnowledgeToSemanticRefIndex(
                 );
             }
         }
+            */
     }
 }
 

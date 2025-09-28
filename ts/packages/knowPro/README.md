@@ -1,11 +1,16 @@
 # KnowPro
 
-**KnowPro** is **experimental sample code** working towards an MVP library for [**Structured RAG**](#structured-rag-overview). KnowPro is early stage, in **active** development, with frequent updates.
+**KnowPro** is **experimental sample code** working towards an MVP library for [**Structured RAG**](#structured-rag-overview). KnowPro is in **active** development, with frequent updates.
 
-- The KnowPro implementation of Structured RAG is used to explore types of [**memory**](../memory/README.md).
+The KnowPro implementation of Structured RAG is used to explore types of [**memory**](../memory/README.md).
+
+- The TypeAgent **Dispatcher** implements **Agent Memory** using [conversation-memory](../memory/conversation/README.md) package.
+- Other [memory types](../memory/conversation/README.md) include:
+  - Transcripts
+  - Documents
+  - Email
+  - Image
 - The [KnowPro test app](../../examples/chat/README.md) demonstrates how to use the KnowPro API and memory implementations.
-
-Note: the TypeAgent **Dispatcher** currently implements **Agent Memory** using an early implementation of Structured RAG found in the [knowledge-processor](../knowledgeProcessor/README.md) package.
 
 ## API
 
@@ -18,6 +23,7 @@ Note: the TypeAgent **Dispatcher** currently implements **Agent Memory** using a
 
 Examples of using the above APIs can be found here:
 
+- [KnowProwTest](../knowProTest/README.md)
 - [KnowPro + Memory examples](../../examples/chat/README.md)
 - [Memory implementations](../memory/README.md)
 
@@ -34,7 +40,7 @@ Examples of using the above APIs can be found here:
 - Information retrieved by executing a query can also be used to retrieve the messages it originated in.
 - Natural language user requests are translated to search query expressions. These query expressions are then evaluated. Query results are used to generate answers to user requests.
 
-You can learn more about Structurd RAG in the [TypeAgent memory architecture](../../../docs/content/architecture/memory.md) document.
+You can learn more about Structured RAG in the [TypeAgent memory architecture](../../../docs/content/architecture/memory.md) document.
 
 ## KnowPro implementation
 

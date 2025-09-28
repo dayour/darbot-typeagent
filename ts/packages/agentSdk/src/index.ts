@@ -18,6 +18,7 @@ export {
     ActivityContext,
     AppAgentInitSettings,
     ResolveEntityResult,
+    ActivityCacheSpec,
 } from "./agentInterface.js";
 
 export {
@@ -25,6 +26,7 @@ export {
     CommandDescriptors,
     CommandDescriptorTable,
     AppAgentCommandInterface,
+    CompletionGroup,
 } from "./command.js";
 
 export {
@@ -54,6 +56,7 @@ export {
     ActionResultSuccessNoDisplay,
     ActionResultSuccess,
     ActionResult,
+    ActionResultActivityContext,
 } from "./action.js";
 
 export type {

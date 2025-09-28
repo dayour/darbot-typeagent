@@ -5,6 +5,7 @@ import { DeepPartialUndefined } from "common-utils";
 import * as Telemetry from "telemetry";
 import { ExplanationData } from "../explanation/explanationData.js";
 import {
+    equalNormalizedObject,
     getFullActionName,
     getTranslationNamesForActions,
     RequestAction,
@@ -12,6 +13,7 @@ import {
 import {
     SchemaInfoProvider,
     doCacheAction,
+    isValidActionSchemaFileHash,
 } from "../explanation/schemaInfoProvider.js";
 import { ConstructionStore, ConstructionStoreImpl } from "./store.js";
 import { ExplainerFactory } from "./factory.js";
@@ -52,20 +54,33 @@ function getFailedResult(message: string): ProcessRequestActionResult {
 // Construction namespace policy
 export function getSchemaNamespaceKeys(
     schemaNames: string[],
-    schemaInfoProvider?: SchemaInfoProvider,
+    activityName: string | undefined,
+    schemaInfoProvider: SchemaInfoProvider | undefined,
 ) {
     // Current namespace keys policy is just combining schema name its file hash
-    return schemaInfoProvider
-        ? schemaNames.map(
-              (name) =>
-                  `${name},${schemaInfoProvider.getActionSchemaFileHash(name)}`,
-          )
-        : schemaNames;
+    return schemaNames.map(
+        (name) =>
+            `${name},${schemaInfoProvider?.getActionSchemaFileHash(name) ?? ""},${activityName ?? ""}`,
+    );
+}
+
+function splitSchemaNamespaceKey(namespaceKey: string): {
+    schemaName: string;
+    hash: string | undefined;
+    activityName: string | undefined;
+} {
+    const [schemaName, hash, activityName] = namespaceKey.split(",");
+    return {
+        schemaName,
+        hash: hash !== "" ? hash : undefined,
+        activityName: activityName !== "" ? activityName : undefined,
+    };
 }
 
 export class AgentCache {
     private _constructionStore: ConstructionStoreImpl;
     private readonly explainWorkQueue: ExplainWorkQueue;
+    // Function to return whether the namespace key matches to the current schema file's hash.
     private readonly namespaceKeyFilter?: NamespaceKeyFilter;
     private readonly logger: Telemetry.Logger | undefined;
     public model?: string;
@@ -91,10 +106,12 @@ export class AgentCache {
 
         if (schemaInfoProvider) {
             this.namespaceKeyFilter = (namespaceKey) => {
-                const [schemaName, hash] = namespaceKey.split(",");
-                return (
-                    schemaInfoProvider.getActionSchemaFileHash(schemaName) ===
-                    hash
+                const { schemaName, hash } =
+                    splitSchemaNamespaceKey(namespaceKey);
+                return isValidActionSchemaFileHash(
+                    schemaInfoProvider,
+                    schemaName,
+                    hash,
                 );
             };
         }
@@ -104,8 +121,15 @@ export class AgentCache {
         return this._constructionStore;
     }
 
-    public getNamespaceKeys(schemaNames: string[]) {
-        return getSchemaNamespaceKeys(schemaNames, this.schemaInfoProvider);
+    public getNamespaceKeys(
+        schemaNames: string[],
+        namespaceSuffix: string | undefined,
+    ) {
+        return getSchemaNamespaceKeys(
+            schemaNames,
+            namespaceSuffix,
+            this.schemaInfoProvider,
+        );
     }
 
     public getInfo() {
@@ -125,9 +149,9 @@ export class AgentCache {
         options?: ExplanationOptions,
     ): Promise<ProcessRequestActionResult> {
         try {
-            const actions = requestAction.actions;
+            const executableActions = requestAction.actions;
             if (cache) {
-                for (const action of actions) {
+                for (const action of executableActions) {
                     const cacheAction = doCacheAction(
                         action,
                         this.schemaInfoProvider,
@@ -138,6 +162,32 @@ export class AgentCache {
                             `Caching disabled in schema config for action '${getFullActionName(action)}'`,
                         );
                     }
+                }
+            }
+
+            const store = this._constructionStore;
+            const namespaceKeys = this.getNamespaceKeys(
+                getTranslationNamesForActions(executableActions),
+                options?.namespaceSuffix,
+            );
+            // Make sure that we don't already have a construction that will match (but reject because of options)
+            const matchResult = store.match(requestAction.request, {
+                rejectReferences: false,
+                history: requestAction.history,
+                namespaceKeys,
+            });
+
+            const actions = executableActions.map((e) => e.action);
+            for (const match of matchResult) {
+                if (
+                    equalNormalizedObject(
+                        match.match.actions.map((e) => e.action),
+                        actions,
+                    )
+                ) {
+                    return getFailedResult(
+                        `Existing construction matches the request but rejected.`,
+                    );
                 }
             }
 
@@ -157,13 +207,12 @@ export class AgentCache {
             const { explanation, elapsedMs } = explanationResult;
             this.logger?.logEvent("explanation", {
                 request: requestAction.request,
-                actions,
+                actions: executableActions,
                 history: requestAction.history,
                 explanation,
                 elapsedMs,
             });
 
-            const store = this._constructionStore;
             const generateConstruction = cache && store.isEnabled();
             if (generateConstruction && explanation.success) {
                 const construction = explanation.construction;
@@ -172,9 +221,6 @@ export class AgentCache {
                 if (construction === undefined) {
                     message = `Explainer '${this.explainerName}' doesn't support constructions.`;
                 } else {
-                    const namespaceKeys = this.getNamespaceKeys(
-                        getTranslationNamesForActions(actions),
-                    );
                     const result = await store.addConstruction(
                         namespaceKeys,
                         construction,

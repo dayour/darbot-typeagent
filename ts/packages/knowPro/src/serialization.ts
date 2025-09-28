@@ -11,13 +11,23 @@ import {
 import { deserializeEmbeddings, serializeEmbeddings } from "./fuzzyIndex.js";
 import path from "path";
 import { IConversationDataWithIndexes } from "./secondaryIndexes.js";
+import { EmbeddingModelMetadata, modelMetadata_ada002 } from "aiclient";
 
+/**
+ * Write a conversation's data to files.
+ * Persists 2 index files into a directory
+ * @param {IConversationDataWithIndexes} conversationData data to persist
+ * @param dirPath Directory to write persisted files
+ * @param baseFileName Base filename to use for files
+ * @param modelMeta Metadata about embedding models used
+ */
 export async function writeConversationDataToFile(
     conversationData: IConversationDataWithIndexes,
     dirPath: string,
     baseFileName: string,
+    modelMeta?: EmbeddingModelMetadata,
 ): Promise<void> {
-    const fileData = toConversationFileData(conversationData);
+    const fileData = toConversationFileData(conversationData, modelMeta);
     if (fileData.binaryData) {
         if (
             fileData.binaryData.embeddings &&
@@ -41,7 +51,7 @@ export async function writeConversationDataToFile(
 export async function readConversationDataFromFile(
     dirPath: string,
     baseFileName: string,
-    embeddingSize: number | undefined,
+    embeddingSize?: number,
 ): Promise<IConversationDataWithIndexes | undefined> {
     const jsonData = await readJsonFile<ConversationJsonData>(
         path.join(dirPath, baseFileName + DataFileSuffix),
@@ -49,6 +59,11 @@ export async function readConversationDataFromFile(
     if (!jsonData) {
         return undefined;
     }
+    let fileData: ConversationFileData = {
+        jsonData: jsonData,
+        binaryData: {},
+    };
+    validateFileData(fileData, embeddingSize);
     let embeddings: Float32Array[] | undefined;
     if (embeddingSize && embeddingSize > 0) {
         const embeddingsBuffer = await readFile(
@@ -56,13 +71,9 @@ export async function readConversationDataFromFile(
         );
         if (embeddingsBuffer) {
             embeddings = deserializeEmbeddings(embeddingsBuffer, embeddingSize);
+            fileData.binaryData.embeddings = embeddings;
         }
     }
-    let fileData: ConversationFileData = {
-        jsonData: jsonData,
-        binaryData: { embeddings },
-    };
-    validateFileData(fileData);
     fileData.jsonData.fileHeader ??= createFileHeader();
     return fromConversationFileData(fileData);
 }
@@ -115,6 +126,8 @@ type FileHeader = {
 type EmbeddingFileHeader = {
     relatedCount?: number | undefined;
     messageCount?: number | undefined;
+    // The V 0.1 file format requires that all embeddings are the same size
+    modelMetadata?: EmbeddingModelMetadata | undefined;
 };
 
 type EmbeddingData = {
@@ -131,14 +144,28 @@ type ConversationBinaryData = {
     embeddings?: Float32Array[] | undefined;
 };
 
-function validateFileData(fileData: ConversationFileData): void {
+function validateFileData(
+    fileData: ConversationFileData,
+    expectedEmbeddingSize?: number | undefined,
+): void {
     if (fileData.jsonData === undefined) {
         throw new Error(`${Error_FileCorrupt}: Missing json data`);
+    }
+    if (expectedEmbeddingSize && fileData.jsonData.embeddingFileHeader) {
+        const actualEmbeddingSize =
+            fileData.jsonData.embeddingFileHeader.modelMetadata
+                ?.embeddingSize ?? modelMetadata_ada002().embeddingSize;
+        if (expectedEmbeddingSize !== actualEmbeddingSize) {
+            throw new Error(
+                `File has embeddings of size ${actualEmbeddingSize}, expected size ${expectedEmbeddingSize}`,
+            );
+        }
     }
 }
 
 function toConversationFileData(
     conversationData: IConversationDataWithIndexes,
+    modelMeta?: EmbeddingModelMetadata,
 ): ConversationFileData {
     let fileData: ConversationFileData = {
         jsonData: {
@@ -157,7 +184,14 @@ function toConversationFileData(
         fileData.binaryData,
         conversationData.messageIndexData?.indexData,
     );
-
+    const embeddingSize = checkEmbeddingSize(
+        fileData,
+        modelMeta?.embeddingSize,
+    );
+    modelMeta ??= { embeddingSize };
+    if (modelMeta !== undefined) {
+        embeddingFileHeader.modelMetadata = modelMeta;
+    }
     return fileData;
 }
 
@@ -231,6 +265,27 @@ function getEmbeddingsFromBinaryData(
             );
         }
         return length;
+    }
+    return 0;
+}
+
+function checkEmbeddingSize(
+    fileData: ConversationFileData,
+    embeddingSize?: number,
+): number {
+    if (fileData.binaryData) {
+        const embeddings = fileData.binaryData.embeddings;
+        if (embeddings && embeddings.length > 0) {
+            embeddingSize ??= embeddings[0].length;
+            for (let i = 1; i < embeddings.length; ++i) {
+                if (embeddingSize !== embeddings[i].length) {
+                    throw new Error(
+                        `Embeddings not of same size ${embeddingSize}`,
+                    );
+                }
+            }
+            return embeddingSize;
+        }
     }
     return 0;
 }

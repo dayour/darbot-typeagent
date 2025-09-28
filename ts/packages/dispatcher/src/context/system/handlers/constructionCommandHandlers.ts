@@ -4,7 +4,10 @@
 import fs from "node:fs";
 import path from "node:path";
 
-import { getToggleHandlerTable } from "../../../command/handlerUtils.js";
+import {
+    getToggleCommandHandlers,
+    getToggleHandlerTable,
+} from "../../../helpers/command.js";
 import {
     CommandHandlerContext,
     changeContextConfig,
@@ -30,6 +33,7 @@ import {
 } from "@typeagent/agent-sdk/helpers/command";
 import { ActionContext, ParsedCommandParams } from "@typeagent/agent-sdk";
 import fileSize from "file-size";
+import { checkOverwriteFile } from "../../../utils/commandHandlerUtils.js";
 
 async function checkRecreateStore(
     constructionStore: ConstructionStore,
@@ -40,19 +44,6 @@ async function checkRecreateStore(
     }
     const message =
         "Construction store has been modified.  All data will be lost!!! Continue?";
-    if (!(await askYesNoWithContext(context, message, true))) {
-        throw new Error("Aborted!");
-    }
-}
-
-async function checkOverwriteFile(
-    filePath: string | undefined,
-    context: CommandHandlerContext,
-) {
-    if (filePath === undefined || !fs.existsSync(filePath)) {
-        return;
-    }
-    const message = `File '${filePath}' exists.  Overwrite?`;
     if (!(await askYesNoWithContext(context, message, true))) {
         throw new Error("Aborted!");
     }
@@ -488,18 +479,38 @@ export function getConstructionCommandHandlers(): CommandHandlerTable {
                     );
                 },
             ),
-            wildcard: getToggleHandlerTable(
-                "wildcard matching",
-                async (
-                    context: ActionContext<CommandHandlerContext>,
-                    enable: boolean,
-                ) => {
-                    await changeContextConfig(
-                        { cache: { matchWildcard: enable } },
-                        context,
-                    );
+            wildcard: {
+                description: "wildcard matching",
+                defaultSubCommand: "on",
+                commands: {
+                    ...getToggleCommandHandlers(
+                        "wildcard matching",
+                        async (
+                            context: ActionContext<CommandHandlerContext>,
+                            enable: boolean,
+                        ) => {
+                            await changeContextConfig(
+                                { cache: { matchWildcard: enable } },
+                                context,
+                            );
+                        },
+                    ),
+                    entity: getToggleHandlerTable(
+                        "entity wildcard matching",
+                        async (
+                            context: ActionContext<CommandHandlerContext>,
+                            enable: boolean,
+                        ) => {
+                            await changeContextConfig(
+                                {
+                                    cache: { matchEntityWildcard: enable },
+                                },
+                                context,
+                            );
+                        },
+                    ),
                 },
-            ),
+            },
         },
     };
 }

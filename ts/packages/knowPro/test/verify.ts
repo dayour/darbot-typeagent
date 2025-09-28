@@ -12,6 +12,7 @@ import {
     SemanticRef,
     TextRange,
     SemanticRefSearchResult,
+    PropertySearchTerm,
 } from "../src/interfaces.js";
 import { ConversationSearchResult } from "../src/search.js";
 import {
@@ -23,7 +24,8 @@ import {
     matchPropertySearchTermToEntity,
     matchSearchTermToEntity,
 } from "../src/query.js";
-import { isPropertyTerm, isSearchGroupTerm } from "../src/compileLib.js";
+import { isPropertyTerm, isSearchGroupTerm } from "../src/searchLib.js";
+import { AnswerResponse } from "../src/answerResponseSchema.js";
 
 export function expectHasEntities(
     semanticRefs: SemanticRef[],
@@ -173,5 +175,39 @@ export function verifyDidMatchSearchGroup(
         case "or_max":
             verifyDidMatchOneOfTerms(termGroup, semanticRef, kType);
             break;
+    }
+}
+
+export function verifySearchResult(result: ConversationSearchResult) {
+    expect(result.rawSearchQuery).toBeDefined();
+    expect(result.knowledgeMatches.size).toBeGreaterThan(0);
+    expect(result.messageMatches.length).toBeGreaterThan(0);
+}
+
+export function verifySearchResults(results: ConversationSearchResult[]) {
+    expect(results.length).toBeGreaterThan(0);
+    for (let i = 0; i < results.length; ++i) {
+        verifySearchResult(results[i]);
+    }
+}
+
+export function verifyAnswerResponse(response: AnswerResponse) {
+    expect(response.type).toBeDefined();
+    if (response.type === "Answered") {
+        expect(response.answer).toBeDefined();
+    } else {
+        expect(response.whyNoAnswer).toBeDefined();
+    }
+}
+
+export function verifyPropertySearchTermName(
+    property: PropertySearchTerm,
+    name: string,
+) {
+    expect(property.propertyName).toBeDefined();
+    if (typeof property.propertyName === "string") {
+        expect(property.propertyName).toEqual(name);
+    } else {
+        expect(property.propertyName.term.text).toEqual(name);
     }
 }

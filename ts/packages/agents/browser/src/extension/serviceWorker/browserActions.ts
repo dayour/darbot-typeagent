@@ -8,19 +8,7 @@ import {
     awaitPageLoad,
     awaitPageIncrementalUpdates,
 } from "./tabManager";
-import {
-    getTabScreenshot,
-    getTabAnnotatedScreenshot,
-    getTabHTMLFragments,
-    getFilteredHTMLFragments,
-} from "./capture";
-import {
-    getPageSchema,
-    setPageSchema,
-    getStoredPageProperty,
-    setStoredPageProperty,
-} from "./storage";
-import { showBadgeHealthy } from "./ui";
+import { getTabHTMLFragments } from "./capture";
 
 /**
  * Executes a browser action
@@ -85,85 +73,7 @@ export async function runBrowserAction(action: AppAction): Promise<any> {
 
             break;
         }
-        case "search": {
-            await chrome.search.query({
-                disposition: "NEW_TAB",
-                text: action.parameters.query,
-            });
 
-            confirmationMessage = `Opened new tab with query ${action.parameters.query}`;
-            break;
-        }
-        case "followLinkByText": {
-            const targetTab = await getActiveTab();
-            const response = await chrome.tabs.sendMessage(targetTab?.id!, {
-                type: "get_page_links_by_query",
-                query: action.parameters.keywords,
-            });
-
-            if (response && response.url) {
-                if (action.parameters.openInNewTab) {
-                    await chrome.tabs.create({
-                        url: response.url,
-                    });
-                } else {
-                    await chrome.tabs.update(targetTab?.id!, {
-                        url: response.url,
-                    });
-                }
-
-                confirmationMessage = `Navigated to the ${action.parameters.keywords} link`;
-            }
-
-            break;
-        }
-        case "followLinkByPosition": {
-            const targetTab = await getActiveTab();
-            const response = await chrome.tabs.sendMessage(targetTab?.id!, {
-                type: "get_page_links_by_position",
-                position: action.parameters.position,
-            });
-
-            if (response && response.url) {
-                if (action.parameters.openInNewTab) {
-                    await chrome.tabs.create({
-                        url: response.url,
-                    });
-                } else {
-                    await chrome.tabs.update(targetTab?.id!, {
-                        url: response.url,
-                    });
-                }
-
-                confirmationMessage = `Navigated to the ${action.parameters.position} link`;
-            }
-
-            break;
-        }
-        case "scrollDown": {
-            const targetTab = await getActiveTab();
-            await chrome.tabs.sendMessage(targetTab?.id!, {
-                type: "scroll_down_on_page",
-            });
-            break;
-        }
-        case "scrollUp": {
-            const targetTab = await getActiveTab();
-            await chrome.tabs.sendMessage(targetTab?.id!, {
-                type: "scroll_up_on_page",
-            });
-            break;
-        }
-        case "goBack": {
-            const targetTab = await getActiveTab();
-            await chrome.tabs.goBack(targetTab?.id!);
-            break;
-        }
-        case "goForward": {
-            const targetTab = await getActiveTab();
-            await chrome.tabs.goForward(targetTab?.id!);
-            break;
-        }
         case "openFromHistory": {
             const targetTab = await getActiveTab();
             const historyItems = await chrome.history.search({
@@ -204,94 +114,7 @@ export async function runBrowserAction(action: AppAction): Promise<any> {
 
             break;
         }
-        case "readPage": {
-            const targetTab = await getActiveTab();
-            const article = await chrome.tabs.sendMessage(targetTab?.id!, {
-                type: "read_page_content",
-            });
 
-            if (article.error) {
-                confirmationMessage = article.error;
-            }
-
-            if (article?.title) {
-                chrome.tts.speak(article?.title, { lang: article?.lang });
-            }
-
-            if (article?.formattedText) {
-                const lines = article.formattedText as string[];
-                lines.forEach((line) => {
-                    chrome.tts.speak(line, {
-                        lang: article?.lang,
-                        enqueue: true,
-                    });
-                });
-            }
-
-            console.log(article);
-            break;
-        }
-        case "stopReadPage": {
-            chrome.tts.stop();
-            break;
-        }
-        case "zoomIn": {
-            const targetTab = await getActiveTab();
-            if (targetTab?.url?.startsWith("https://paleobiodb.org/")) {
-                const result = await chrome.tabs.sendMessage(targetTab.id!, {
-                    type: "run_paleoBioDb_action",
-                    action: action,
-                });
-            } else {
-                const currentZoom = await chrome.tabs.getZoom();
-                if (currentZoom < 5) {
-                    var stepValue = 1;
-                    if (currentZoom < 2) {
-                        stepValue = 0.25;
-                    }
-
-                    await chrome.tabs.setZoom(currentZoom + stepValue);
-                }
-            }
-
-            break;
-        }
-        case "zoomOut": {
-            const targetTab = await getActiveTab();
-            if (targetTab?.url?.startsWith("https://paleobiodb.org/")) {
-                const result = await chrome.tabs.sendMessage(targetTab.id!, {
-                    type: "run_paleoBioDb_action",
-                    action: action,
-                });
-            } else {
-                const currentZoom = await chrome.tabs.getZoom();
-                if (currentZoom > 0) {
-                    var stepValue = 1;
-                    if (currentZoom < 2) {
-                        stepValue = 0.25;
-                    }
-
-                    await chrome.tabs.setZoom(currentZoom - stepValue);
-                }
-            }
-            break;
-        }
-        case "zoomReset": {
-            await chrome.tabs.setZoom(0);
-            break;
-        }
-        case "captureScreenshot": {
-            responseObject = await getTabScreenshot(
-                action.parameters?.downloadAsFile,
-            );
-            break;
-        }
-        case "captureAnnotatedScreenshot": {
-            responseObject = await getTabAnnotatedScreenshot(
-                action.parameters?.downloadAsFile,
-            );
-            break;
-        }
         case "getHTML": {
             const targetTab = await getActiveTab();
 
@@ -301,22 +124,9 @@ export async function runBrowserAction(action: AppAction): Promise<any> {
                 action.parameters?.downloadAsFile,
                 action.parameters?.extractText,
                 action.parameters?.useTimestampIds,
+                action.parameters?.filterToReadingView,
+                action.parameters?.keepMetaTags,
             );
-            break;
-        }
-        case "getFilteredHTMLFragments": {
-            const targetTab = await getActiveTab();
-
-            responseObject = await getFilteredHTMLFragments(
-                targetTab!,
-                action.parameters.fragments,
-                action.parameters.cssSelectorsToKeep,
-            );
-            break;
-        }
-        case "getPageUrl": {
-            const targetTab = await getActiveTab();
-            responseObject = targetTab?.url;
             break;
         }
         case "awaitPageLoad": {
@@ -358,39 +168,55 @@ export async function runBrowserAction(action: AppAction): Promise<any> {
             });
             break;
         }
-        case "getPageSchema": {
-            const targetTab = await getActiveTab();
-            const key = action.parameters.url ?? targetTab?.url;
-            if (key) {
-                responseObject = await getPageSchema(key);
-                if (responseObject) {
-                    showBadgeHealthy();
-                }
-            }
+        case "getActionsForUrl": {
+            // Enhanced action retrieval with ActionsStore support
+            responseObject = await chrome.runtime.sendMessage({
+                type: "getActionsForUrl",
+                url: action.parameters.url,
+                includeGlobal: action.parameters.includeGlobal,
+                author: action.parameters.author,
+            });
             break;
         }
-        case "setPageSchema": {
-            const key = action.parameters.url;
-            if (key) {
-                await setPageSchema(key, action.parameters.schema);
-            }
-            break;
-        }
-        case "getPageStoredProperty": {
-            responseObject = await getStoredPageProperty(
-                action.parameters.url,
-                action.parameters.key,
+        case "downloadContentWithBrowser": {
+            // Import and use the existing message handler
+            const { handleMessage } = await import("./messageHandlers.js");
+            const result = await handleMessage(
+                {
+                    type: "downloadContentWithBrowser",
+                    url: action.parameters.url,
+                    options: action.parameters.options,
+                },
+                {} as chrome.runtime.MessageSender,
             );
+
+            responseObject = result;
+            confirmationMessage = result?.success
+                ? "Content downloaded successfully"
+                : "Content download failed";
             break;
         }
-        case "setPageStoredProperty": {
-            await setStoredPageProperty(
-                action.parameters.url,
-                action.parameters.key,
-                action.parameters.value,
+        case "processHtmlContent": {
+            // Import and use the existing message handler
+            const { handleMessage } = await import("./messageHandlers.js");
+            const result = await handleMessage(
+                {
+                    type: "processHtmlContent",
+                    htmlContent: action.parameters.htmlContent,
+                    options: action.parameters.options,
+                },
+                {} as chrome.runtime.MessageSender,
             );
+
+            responseObject = result;
+            confirmationMessage = result?.success
+                ? "HTML processed successfully"
+                : "HTML processing failed";
             break;
         }
+
+        default:
+            throw new Error(`Unknown action: ${actionName}. `);
     }
 
     return {

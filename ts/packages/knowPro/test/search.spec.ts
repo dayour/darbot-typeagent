@@ -4,6 +4,7 @@
 import {
     IConversation,
     KnowledgeType,
+    PropertySearchTerm,
     SearchTermGroup,
     SemanticRefSearchResult,
 } from "../src/interfaces.js";
@@ -12,6 +13,11 @@ import {
     createSearchTerm,
     createAndTermGroup,
     createOrTermGroup,
+    createPropertySearchTerm,
+    createOrMaxTermGroup,
+    createTopicSearchTermGroup,
+    createEntitySearchTermGroup,
+    isPropertyTerm,
 } from "../src/searchLib.js";
 import {
     emptyConversation,
@@ -28,9 +34,12 @@ import {
     resolveAndVerifyKnowledgeMatches,
     resolveAndVerifySemanticRefs,
     verifyDidMatchSearchGroup,
+    verifyPropertySearchTermName,
     verifySemanticRefResult,
 } from "./verify.js";
 import { hasTestKeys, describeIf } from "test-lib";
+import { validateSearchTermGroup } from "../src/compileLib.js";
+import { PropertyNames } from "../src/propertyIndex.js";
 
 /**
  * These tests are designed to run offline.
@@ -137,6 +146,121 @@ describe("search.offline", () => {
                 termGroup,
             );
             resolveAndVerifyKnowledgeMatches(conversation, results);
+        },
+        testTimeout,
+    );
+    test(
+        "searchTermGroup.validate",
+        () => {
+            let stg = createAndTermGroup();
+
+            let term = createSearchTerm("book");
+            term.relatedTerms = [{ text: "novel" }, { text: "fiction" }];
+            stg.terms.push(term);
+            term = createSearchTerm("movie");
+            stg.terms.push(term);
+            let propertyTerm = createPropertySearchTerm("type", "book");
+            stg.terms.push(propertyTerm);
+
+            let nestedGroup = createOrMaxTermGroup();
+            term = createSearchTerm("bicycle");
+            term.relatedTerms = [{ text: "bike" }, { text: "cycle" }];
+            nestedGroup.terms.push(term);
+            propertyTerm = createPropertySearchTerm("type", "album");
+            nestedGroup.terms.push(term);
+
+            stg.terms.push(nestedGroup);
+
+            let error = validateSearchTermGroup(stg);
+            expect(error).toBeUndefined();
+
+            stg = createOrTermGroup();
+            (stg as any).booleanOp = "";
+            error = validateSearchTermGroup(stg);
+            expect(error).toBeDefined();
+
+            stg = createOrTermGroup();
+            error = validateSearchTermGroup(stg);
+            expect(error).toBeDefined();
+
+            term = createSearchTerm("");
+            stg.terms.push(term);
+            error = validateSearchTermGroup(stg);
+            expect(error).toBeDefined();
+            stg.terms.pop();
+
+            term = createSearchTerm("book");
+            stg.terms.push(term);
+            term.relatedTerms = [];
+            term.relatedTerms.push({ text: "novel" });
+            term.relatedTerms.push({ text: "" });
+            error = validateSearchTermGroup(stg);
+            expect(error).toBeDefined();
+            stg.terms.pop();
+
+            term = createSearchTerm("book");
+            stg.terms.push(term);
+            term.relatedTerms = [];
+            term.relatedTerms.push({ text: "novel" });
+            term.relatedTerms.push({ text: "fiction" });
+            error = validateSearchTermGroup(stg);
+            expect(error).toBeUndefined();
+
+            propertyTerm = createPropertySearchTerm("", "value");
+            stg.terms.push(propertyTerm);
+            error = validateSearchTermGroup(stg);
+            expect(error).toBeDefined();
+            stg.terms.pop();
+
+            propertyTerm = createPropertySearchTerm("name", "");
+            stg.terms.push(propertyTerm);
+            error = validateSearchTermGroup(stg);
+            expect(error).toBeDefined();
+            stg.terms.pop();
+
+            propertyTerm = createPropertySearchTerm("name", "value");
+            stg.terms.push(propertyTerm);
+            error = validateSearchTermGroup(stg);
+            expect(error).toBeUndefined();
+
+            nestedGroup = createOrTermGroup();
+            propertyTerm = createPropertySearchTerm("", "value");
+            nestedGroup.terms.push(propertyTerm);
+            stg.terms.push(nestedGroup);
+            error = validateSearchTermGroup(stg);
+            expect(error).toBeDefined();
+        },
+        testTimeout,
+    );
+    test(
+        "propertySearchGroup",
+        () => {
+            let topicTerms = ["music", "dance"];
+            let termGroup = createTopicSearchTermGroup(topicTerms);
+            validateSearchTermGroup(termGroup);
+
+            expect(termGroup.terms.length).toEqual(topicTerms.length);
+            for (let i = 0; i < termGroup.terms.length; ++i) {
+                const term = termGroup.terms[i];
+                expect(isPropertyTerm(term)).toBeTruthy();
+                if (isPropertyTerm(term)) {
+                    verifyPropertySearchTermName(term, PropertyNames.Topic);
+                    expect(term.propertyValue.term.text).toEqual(topicTerms[i]);
+                }
+            }
+
+            termGroup = createEntitySearchTermGroup(
+                "jane",
+                "person",
+                "job",
+                "scientist",
+            );
+            validateSearchTermGroup(termGroup);
+            expect(termGroup.terms.length).toEqual(4);
+            let propertyTerm = termGroup.terms[2] as PropertySearchTerm;
+            verifyPropertySearchTermName(propertyTerm, "facet.name");
+            propertyTerm = termGroup.terms[3] as PropertySearchTerm;
+            verifyPropertySearchTermName(propertyTerm, "facet.value");
         },
         testTimeout,
     );

@@ -36,9 +36,11 @@ import {
     createMatchTermsBooleanExpr,
     isActionPropertyTerm,
     isEntityPropertyTerm,
-    isPropertyTerm,
-    isSearchGroupTerm,
+    toRequiredSearchTerm,
+    validateSearchTermGroup,
 } from "./compileLib.js";
+import { isSearchGroupTerm } from "./searchLib.js";
+import { isPropertyTerm } from "./searchLib.js";
 import { NormalizedEmbedding } from "typeagent";
 import { getTimestampedScoredSemanticRefOrdinals } from "./knowledgeLib.js";
 
@@ -80,8 +82,17 @@ export function createSearchOptionsTypical(): SearchOptions {
     };
 }
 
+/**
+ * Search matches returned by searchConversation {@link searchConversation}
+ */
 export type ConversationSearchResult = {
+    /**
+     * The ordinals of matching messages. You can use these ordinals to load messages
+     */
     messageMatches: ScoredMessageOrdinal[];
+    /**
+     * For each matching knowledge type, the ordinals of the matching knowledge.
+     */
     knowledgeMatches: Map<KnowledgeType, SemanticRefSearchResult>;
     rawSearchQuery?: string | undefined;
 };
@@ -150,6 +161,11 @@ export async function searchConversationKnowledge(
     if (!q.isConversationSearchable(conversation)) {
         return undefined;
     }
+    let error = validateSearchTermGroup(searchTermGroup);
+    if (error !== undefined) {
+        throw new Error(error);
+    }
+
     options ??= createSearchOptions();
     const queryBuilder = new QueryCompiler(
         conversation,
@@ -223,6 +239,27 @@ export async function runSearchQuery(
         if (searchResults) {
             results.push(searchResults);
         }
+    }
+    return results;
+}
+
+/**
+ * Run multiple queries
+ * @param conversation
+ * @param queries queries to run
+ * @param options
+ * @returns
+ */
+export async function runSearchQueries(
+    conversation: IConversation,
+    queries: SearchQueryExpr[],
+    options?: SearchOptions,
+): Promise<ConversationSearchResult[][]> {
+    // FUTURE: do these in parallel
+    const results: ConversationSearchResult[][] = [];
+    for (let i = 0; i < queries.length; ++i) {
+        const result = await runSearchQuery(conversation, queries[i], options);
+        results.push(result);
     }
     return results;
 }
@@ -491,6 +528,7 @@ class QueryCompiler {
 
     public compileSearchGroupMessages(
         searchGroup: SearchTermGroup,
+        matchFilter?: q.IQuerySemanticRefPredicate, // A filter applied after the term group matches
     ): [CompiledTermGroup[], q.IQueryOpExpr<MessageAccumulator>] {
         return this.compileSearchGroup(
             searchGroup,
@@ -500,6 +538,8 @@ class QueryCompiler {
                     booleanOp,
                 );
             },
+            undefined,
+            matchFilter,
         );
     }
 
@@ -511,6 +551,7 @@ class QueryCompiler {
             scopeExpr?: q.GetScopeExpr,
         ) => IQueryOpExpr,
         scopeExpr?: q.GetScopeExpr,
+        matchFilter?: q.IQuerySemanticRefPredicate, // A filter applied after the term group matches
     ): [CompiledTermGroup[], q.IQueryOpExpr] {
         const compiledTerms: CompiledTermGroup[] = [
             { booleanOp: searchGroup.booleanOp, terms: [] },
@@ -518,20 +559,36 @@ class QueryCompiler {
         const termExpressions: q.IQueryOpExpr[] = [];
         for (const term of searchGroup.terms) {
             if (isPropertyTerm(term)) {
-                termExpressions.push(this.compilePropertyTerm(term));
+                let termExpr = this.compilePropertyTerm(term);
+                termExpr =
+                    matchFilter !== undefined
+                        ? new q.FilterMatchTermExpr(termExpr, matchFilter)
+                        : termExpr;
+                termExpressions.push(termExpr);
                 if (typeof term.propertyName !== "string") {
-                    compiledTerms[0].terms.push(term.propertyName);
+                    compiledTerms[0].terms.push(
+                        toRequiredSearchTerm(term.propertyName),
+                    );
                 }
-                compiledTerms[0].terms.push(term.propertyValue);
+                compiledTerms[0].terms.push(
+                    toRequiredSearchTerm(term.propertyValue),
+                );
             } else if (isSearchGroupTerm(term)) {
                 const [nestedTerms, groupExpr] = this.compileSearchGroup(
                     term,
                     createOp,
+                    undefined,
+                    matchFilter,
                 );
                 compiledTerms.push(...nestedTerms);
                 termExpressions.push(groupExpr);
             } else {
-                termExpressions.push(this.compileSearchTerm(term));
+                let termExpr = this.compileSearchTerm(term);
+                termExpr =
+                    matchFilter !== undefined
+                        ? new q.FilterMatchTermExpr(termExpr, matchFilter)
+                        : termExpr;
+                termExpressions.push(termExpr);
                 compiledTerms[0].terms.push(term);
             }
         }
@@ -612,7 +669,7 @@ class QueryCompiler {
         if (filter && filter.tags && filter.tags.length > 0) {
             scopeSelectors ??= [];
             this.addTermsScopeSelector(
-                createTagSearchTermGroup(filter.tags),
+                createTagSearchTermGroup(filter.tags, true),
                 scopeSelectors,
             );
         }
@@ -633,6 +690,16 @@ class QueryCompiler {
                 );
             }
         }
+        // Structured Tags
+        if (
+            filter &&
+            filter.tagMatchingTerms &&
+            filter.tagMatchingTerms.terms.length > 0
+        ) {
+            scopeSelectors ??= [];
+            this.addSTagScopeSelector(filter.tagMatchingTerms, scopeSelectors);
+        }
+
         return scopeSelectors && scopeSelectors.length > 0
             ? new q.GetScopeExpr(scopeSelectors)
             : undefined;
@@ -641,15 +708,24 @@ class QueryCompiler {
     private addTermsScopeSelector(
         termGroup: SearchTermGroup,
         scopeSelectors: q.IQueryTextRangeSelector[],
+        matchFilter?: q.IQuerySemanticRefPredicate, // A filter applied after the term group matches
     ) {
         if (termGroup.terms.length > 0) {
             const [searchTermsUsed, selectExpr] =
-                this.compileSearchGroupMessages(termGroup);
+                this.compileSearchGroupMessages(termGroup, matchFilter);
             scopeSelectors.push(
                 new q.TextRangesFromMessagesSelector(selectExpr),
             );
             this.allScopeSearchTerms.push(...searchTermsUsed);
         }
+    }
+
+    private addSTagScopeSelector(
+        termGroup: SearchTermGroup,
+        scopeSelectors: q.IQueryTextRangeSelector[],
+    ) {
+        const filter = new q.KnowledgeTypePredicate("sTag");
+        return this.addTermsScopeSelector(termGroup, scopeSelectors, filter);
     }
 
     private compileWhere(filter: WhenFilter): q.IQuerySemanticRefPredicate[] {
@@ -790,7 +866,11 @@ class QueryCompiler {
      * Return false if the term should be rejected
      */
     private validateAndPrepareTerm(term: Term | undefined): boolean {
-        if (term) {
+        if (
+            term !== undefined &&
+            term.text !== undefined &&
+            term.text.length > 0
+        ) {
             term.text = term.text.toLowerCase();
         }
         return true;
